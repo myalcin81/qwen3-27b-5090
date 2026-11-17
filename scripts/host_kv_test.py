@@ -18,6 +18,23 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "engine/python"), str(ROOT / "reference")]
 
 
+def fingerprint(eng, n, kv_dtype):
+    """Hash every valid KV row (including scales) and all GDN states for GPU cache acceptance tests."""
+    from q27lib import lib
+
+    row_bytes = {"nvfp4": 144, "fp8": 256, "bf16": 512}[kv_dtype]
+    kv = ctypes.create_string_buffer(2 * n * 4 * row_bytes)
+    state = ctypes.create_string_buffer(48 * 128 * 128 * 4)
+    hashes = []
+    for layer in range(16):
+        eng._check(lib().q27_debug_kv(eng.h, layer, 0, n, kv), "debug_kv")
+        hashes.append(hashlib.sha256(kv.raw).hexdigest())
+    for layer in range(48):
+        eng._check(lib().q27_debug_ssm(eng.h, layer, state), "debug_ssm")
+        hashes.append(hashlib.sha256(state.raw).hexdigest())
+    return hashes
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--weights", default="gdnfp4")
@@ -32,7 +49,7 @@ def main():
                                                 "CHECKPOINT_INTERVAL", "MAX_SEQS", "MAX_TOKENS_FIT")}, flush=True)
     print("runtime:", {k: os.environ.get(k, "default") for k in
                        ("Q27_SKINNY_EXACT", "Q27_ATTN_TC", "Q27_SPEC_PATHS", "Q27_PAGES_HIGH")}, flush=True)
-    from q27lib import Engine, lib
+    from q27lib import Engine
     from qwen27b.paths import draft_snapshot, engine_target
 
     prompts = [json.loads(line)["ids"] for line in (ROOT / "bench/golden/prompts.jsonl").read_text().splitlines()]
@@ -61,20 +78,6 @@ def main():
         assert len(out) == count
         return out
 
-    def fingerprint(n):
-        # Every valid KV row in all 16 attention layers, including NVFP4 scales, and all 48 FP32 GDN states.
-        row_bytes = {"nvfp4": 144, "fp8": 256, "bf16": 512}[args.kv_dtype]
-        kv = ctypes.create_string_buffer(2 * n * 4 * row_bytes)
-        state = ctypes.create_string_buffer(48 * 128 * 128 * 4)
-        hashes = []
-        for layer in range(16):
-            eng._check(lib().q27_debug_kv(eng.h, layer, 0, n, kv), "debug_kv")
-            hashes.append(hashlib.sha256(kv.raw).hexdigest())
-        for layer in range(48):
-            eng._check(lib().q27_debug_ssm(eng.h, layer, state), "debug_ssm")
-            hashes.append(hashlib.sha256(state.raw).hexdigest())
-        return hashes
-
     try:
         for spec in (False, True):
             for partial in (False, True):
@@ -86,7 +89,7 @@ def main():
                 pos = eng.pos
                 assert pos == len(prompt) + len(generated) - 1
                 assert bool(pos % 64) == partial
-                expected_bytes = fingerprint(pos)
+                expected_bytes = fingerprint(eng, pos, args.kv_dtype)
                 request = prompt + generated[:-1] + tail
                 eng.reset()
 
@@ -94,7 +97,7 @@ def main():
                 if args.park:
                     run(unique_prompt()[:256], spec, 1)
                     parked_pos = eng.pos
-                    parked_bytes = fingerprint(parked_pos)
+                    parked_bytes = fingerprint(eng, parked_pos, args.kv_dtype)
                     parked = eng.seq_park()
 
                 before = eng.cache_stats()
@@ -111,7 +114,7 @@ def main():
                 cached = eng.prefix_begin(request, spec=spec)
                 assert cached == pos, (label, "checkpoint lost under GPU pressure", cached, pos, st)
                 assert eng.cache_stats()["kv_restored_pages"] > restored_before, (label, "no host restore")
-                assert fingerprint(pos) == expected_bytes, (label, "KV/GDN bytes differ after restore")
+                assert fingerprint(eng, pos, args.kv_dtype) == expected_bytes, (label, "KV/GDN bytes differ after restore")
                 got = run(request[pos:], spec, 32)
 
                 # Replay exactly the same prefill/decode chunk boundaries without consulting the cache.
@@ -122,7 +125,7 @@ def main():
                 if parked is not None:
                     eng.reset()
                     eng.seq_unpark(parked)
-                    assert fingerprint(parked_pos) == parked_bytes, (label, "parked state/KV changed")
+                    assert fingerprint(eng, parked_pos, args.kv_dtype) == parked_bytes, (label, "parked state/KV changed")
                     eng.reset()
                 print("PASS", label, eng.cache_stats(), flush=True)
         print("All forced-eviction byte/token parity cases passed.", flush=True)
