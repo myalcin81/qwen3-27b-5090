@@ -102,16 +102,44 @@ def tool_schemas(tools):
 
 def parse_call_block(block, schemas):
     """The calls of one `<tool_call>...</tool_call>` block: [{"name", "arguments" (dict)}]."""
-    calls = []
-    for m in re.finditer(r"<function=([^>\n]+)>(.*?)</function>", block, re.S):
-        name, body = m.group(1).strip(), m.group(2)
+    calls, pos = [], 0
+    decoder = json.JSONDecoder()
+    function = re.compile(r"<function=([^>\n]+)>")
+    parameter = re.compile(r"<parameter=([^>\n]+)>|</function>")
+    whitespace = re.compile(r"\s*")
+    close_parameter = re.compile(r"\s*</parameter>")
+    while (m := function.search(block, pos)) is not None:
+        name = m.group(1).strip()
+        pos = m.end()
         props = schemas.get(name, {})
         args = {}
-        for p in re.finditer(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", body, re.S):
+        while (p := parameter.search(block, pos)) is not None:
+            pos = p.end()
+            if p.group(1) is None:
+                calls.append({"name": name, "arguments": args})
+                break
             pname = p.group(1).strip()
-            schema = props.get(pname)
-            args[pname] = _convert(p.group(2), schema) if schema is not None else _convert(p.group(2), {})
-        calls.append({"name": name, "arguments": args})
+            schema = props.get(pname) or {}
+            start = pos + (block[pos:pos + 1] == "\n")
+            end = block.find("</parameter>", start)
+            # Valid object/array JSON can quote XML delimiters as data. Skip the complete JSON value before
+            # looking for its closing parameter/function tag; raw string parameters retain their old format.
+            first = whitespace.match(block, start).end()
+            if _types(schema) != {"string"} and block[first:first + 1] in ("{", "["):
+                try:
+                    _, json_end = decoder.raw_decode(block, first)
+                    tail = close_parameter.match(block, json_end)
+                    if tail:
+                        end = tail.end() - len("</parameter>")
+                except (ValueError, RecursionError):
+                    pass  # Legacy malformed/non-JSON values still use the XML delimiter.
+            if end < 0:
+                break
+            value = block[start:end]
+            args[pname] = _convert(value[:-1] if value.endswith("\n") else value, schema)
+            pos = end + len("</parameter>")
+        else:
+            break
     return calls
 
 
@@ -442,6 +470,8 @@ def anthropic_tools(tools):
             continue
         out.append({"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
                                                      "parameters": t.get("input_schema") or {"type": "object"}}})
+        if "strict" in t:
+            out[-1]["function"]["strict"] = t["strict"]
     return out
 
 
@@ -601,6 +631,8 @@ def responses_tools(tools):
     def function(t, ns=None):
         out.append({"type": "function", "function": {"name": t["name"], "description": t.get("description", ""),
                                                      "parameters": t.get("parameters") or {"type": "object", "properties": {}}}})
+        if "strict" in t:
+            out[-1]["function"]["strict"] = t["strict"]
         if ns:
             namespaces[t["name"]] = ns
 

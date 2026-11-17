@@ -114,10 +114,11 @@ def anthropic_format(body):
     return ("json", fmt["schema"])
 
 
-def grammar(spec, lead_ws=False, calls=None):
+def grammar(spec, lead_ws=False, calls=None, call_rules=None):
     """The llguidance grammar of a spec. lead_ws: whitespace may come first (after the reasoning, the template's blank
     line). calls: (id of <tool_call>, id of </tool_call>) when the model may call tools instead (tool_choice auto):
-    the output is then the format or tool calls. Raises ValueError for a format llguidance cannot take."""
+    the output is then the format or tool calls. call_rules replaces the permissive calls rule for strict tools.
+    Raises ValueError for a format llguidance cannot take."""
     kind, v = spec
     rules = ""
     if kind == "json":
@@ -138,7 +139,9 @@ def grammar(spec, lead_ws=False, calls=None):
     lark = ("start: " + ("/[ \\t\\r\\n]*/ " if lead_ws else "") + "body\n"
             + "body: out" + (" | calls" if calls else "") + "\n"
             + "out: " + out + "\n")
-    if calls:
+    if call_rules is not None:
+        lark += call_rules
+    elif calls:
         a, b = calls
         lark += f"calls: <[{a}]> (<[{a}]> | <[{b}]> | /(.|\\n)+/)*\n"
     lark += rules

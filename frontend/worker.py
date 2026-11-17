@@ -222,10 +222,22 @@ class Scheduler:
             try:
                 s.matcher = self.matcher(s.grammar)
             except ValueError as e:
+                fallback = req.get("strict_tools_fallback")
+                if req.get("strict_tools") and isinstance(fallback, dict):
+                    log("strict_tools: request uses legacy mode (tokenizer matcher rejected the grammar)")
+                    self.m["q27:strict_tool_fallbacks_total"] += 1
+                    # One retry, before any engine work. Recreate Seq so required/named prefixes are restored.
+                    legacy = dict(req, **fallback)
+                    legacy.pop("strict_tools_fallback", None)
+                    legacy["strict_tools"] = False
+                    self.submit(rid, legacy)
+                    return
                 self.send("error", rid, str(e), 400)
                 return
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
+            if req.get("strict_tools"):
+                self.m["q27:strict_tool_requests_total"] += 1
         s.reusable = self.reusable(s.prompt)
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run

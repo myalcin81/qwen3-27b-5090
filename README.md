@@ -260,7 +260,25 @@ model may call a tool instead. A format that cannot be compiled is a 400. Gramma
 Tool choice: `tool_choice` forces a call in all three APIs: a named tool (OpenAI `{"type": "function", ...}`, Anthropic
 `{"type": "tool", "name": ...}`) gives one call of it, any tool (`required`, Anthropic `any`) at least one call. The
 server writes the start of the call into the answer (after the reasoning, with thinking on) and the model writes the
-arguments; they are not checked against the tool's schema. Responses `allowed_tools` is taken as its `mode` alone.
+arguments; by default they are not checked against the tool's schema. Responses `allowed_tools` is taken as its
+`mode` alone.
+
+Opt-in tool grammars: set `STRICT_TOOLS=1` for all tools, or set `strict: true` on an OpenAI function definition
+(including Responses) or an Anthropic tool. Tool names are then restricted to the request's definitions. Strict
+tools emit declared parameters in schema order, with required fields present, no duplicates, and typed values.
+String arguments remain raw text (including newlines and shell escapes); enums, const and length bounds are
+supported. Integer, number, boolean, null, object and array parameters use JSON-schema subgrammars. A required or
+named choice is generated entirely through the grammar; auto starts masking at the first tool-call token, leaving
+ordinary answers and reasoning unaffected. `parallel_tool_calls: false` / `disable_parallel_tool_use` limits it to
+one call. Existing structured response formats can still be combined with tools.
+
+This is a bounded, best-effort schema subset: nullable/string unions, string patterns, top-level schema
+compositions and unsupported compiler features fall back **per tool** to legacy arguments with a `strict_tools`
+warning. Tool names remain constrained. Invalid names, duplicate definitions, more than 128 tools, over 256 KiB of
+schemas or a grammar above 1 MiB cause a request-wide fallback. A strict tool supports up to 64 declared parameters.
+Raw string values cannot contain XML function/parameter delimiters; nested JSON strings can. Truncated generations
+can still be incomplete. Tool execution permissions and semantic checks remain the caller's responsibility.
+GPU throughput and real-session tool error rates must be measured before enabling this by default.
 
 Logprobs: chat completions take `logprobs: true` and `top_logprobs` (0 to 20), completions `logprobs` (0 to 20), the
 Responses API `include: ["message.output_text.logprobs"]` and `top_logprobs` (0 to 20), also when streaming. The values
