@@ -112,6 +112,7 @@ everywhere above.
 | `HTTP_MAX_CONNECTIONS` | 32 | Maximum simultaneous HTTP connections, including idle keep-alive connections and UI event streams |
 | `HTTP_TIMEOUT_S` | 30 | Socket inactivity timeout, and separate overall deadlines for reading the request headers and POST body, in seconds |
 | `MAX_PENDING_REQUESTS` | 32 | Maximum running and queued generations together; admission above this returns 503 |
+| `TOKENIZER_CACHE_MIB` | 32 | CPU cache of exact text encodings, per tokenizer instance; `0` disables it. Retained strings and packed token IDs have an estimated MiB budget, at most 256 entries, and at most one quarter of the budget per entry. Separate ordinary/escaped-text keys preserve token semantics. Templates still render on every call; this helps identical prompts and repeated segments of prompts containing escaped special-token text, not arbitrary partial matches. Disabled for BPE dropout. Requires a server restart; does not reserve pinned memory or GPU KV |
 | `SERVED_MODEL_NAME` | `qwen3.8-27b` | Name in `/v1/models` (requests may use any model name) |
 | `MAX_TOKENS` | 262144 | Context limit of one request. If the KV pool cannot hold it, `MAX_TOKENS_FIT` lowers it; the value in effect is in the startup log (`max_tokens ... lowered to`) and in `/v1/models` (`max_model_len`) |
 | `MAX_TOKENS_FIT` | 1 | 1: start with `MAX_TOKENS` lowered to what the KV pool holds (a multiple of 1,024). 0: fail to start instead (the service then restarts every 60 s). The engine library (`q27lib.Engine`) defaults to 0 |
