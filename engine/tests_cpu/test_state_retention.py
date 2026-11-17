@@ -57,6 +57,27 @@ int main(int argc, char** argv) {
     std::vector<Checkpoint> cs = {ck({1,2,3}, false, 5), ck({1,2,4,5}, false, 5)};
     assert(state_eviction_index(cs, next) == 0); // differing token is not a covered ancestor
     assert(state_eviction_index({}, next) == -1);
+  } else if (test == "inventory_shared") {
+    auto a=ck({1,2,3,4}, true, 1), b=ck({1,2,3,4,5,6}, true, 2);
+    a.pages={1,-1}; b.pages={1,-1,-2};
+    auto v=cache_inventory({a,b},2);
+    assert(v.unique_tokens==6 && v.logical_full_pages==3 && v.physical_full_pages==3);
+    assert(v.page_references==5 && v.gpu_pages==1 && v.host_pages==2 && v.leaves==1);
+  } else if (test == "inventory_duplicates") {
+    auto a=ck({1,2,3,4}, true, 1), b=a;
+    a.pages={1,2}; b.pages={-1,-2};
+    auto v=cache_inventory({a,b},2);
+    assert(v.unique_tokens==4 && v.logical_full_pages==2 && v.physical_full_pages==4);
+    assert(v.leaves==1 && v.page_references==4);
+  } else if (test == "inventory_branches_partial") {
+    auto a=ck({1,2,3},true,1), b=ck({1,2,4,5},true,2), c=ck({1},true,0);
+    a.pages={1,-1}; b.pages={1,-2}; c.pages={1};
+    auto v=cache_inventory({b,c,a},2);
+    assert(v.unique_tokens==5 && v.logical_full_pages==2 && v.physical_full_pages==2);
+    assert(v.host_pages==2 && v.gpu_pages==1 && v.leaves==2);
+  } else if (test == "inventory_empty") {
+    auto v=cache_inventory({},64);
+    assert(v.unique_tokens==0 && v.leaves==0 && v.physical_full_pages==0);
   } else if (test == "forty_sessions") {
     for (bool legacy : {true, false}) {
       std::vector<Checkpoint> cs;
@@ -101,7 +122,8 @@ int main(int argc, char** argv) {
 
 @pytest.mark.parametrize("case", ["intermediate_before_lru", "covered_boundary", "branch_point", "pending_branch",
                                   "ring_compatibility", "equal_tokens_ring_upgrade", "interval_backoff",
-                                  "exact_prefix_and_ties", "forty_sessions"])
+                                  "exact_prefix_and_ties", "forty_sessions", "inventory_shared",
+                                  "inventory_duplicates", "inventory_branches_partial", "inventory_empty"])
 def test_state_slot_retention(retention_test, case):
     result = subprocess.run([str(retention_test), case], capture_output=True, timeout=15)
     assert result.returncode == 0, result.stderr.decode()

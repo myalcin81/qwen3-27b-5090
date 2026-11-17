@@ -45,6 +45,7 @@ SIGNATURES = {
     "q27_checkpoint": ([P], I),
     "q27_cache_stats": ([P, P], I),
     "q27_kv_host_stats": ([P, P], I),
+    "q27_cache_inventory": ([P, P], I),
     "q27_cache_grow": ([P, I, P], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
@@ -436,7 +437,7 @@ class Engine:
         self._check(lib().q27_cache_grow(self.h, n, ctypes.byref(out)), "q27_cache_grow")
         return out.value
 
-    def cache_stats(self):
+    def cache_stats(self, *, inventory=False):
         out = (ctypes.c_int64 * 12)()
         self._check(lib().q27_cache_stats(self.h, out), "q27_cache_stats")
         keys = ("lookups", "hits", "prompt_tokens", "cached_tokens", "saved", "evicted", "checkpoints", "free_pages",
@@ -448,6 +449,13 @@ class Engine:
         if fn := getattr(lib(), "q27_kv_host_stats", None):
             self._check(fn(self.h, host_out), "q27_kv_host_stats")
         result.update(zip(host_keys, host_out))
+        if inventory and (fn := getattr(lib(), "q27_cache_inventory", None)):
+            inventory_keys = ("prefix_unique_tokens", "prefix_logical_full_pages", "prefix_physical_full_pages",
+                              "prefix_duplicate_full_pages", "prefix_page_references", "prefix_gpu_pages",
+                              "prefix_host_pages", "kv_host_unreferenced_pages", "kv_host_used_bytes", "prefix_leaves")
+            inventory_out = (ctypes.c_int64 * len(inventory_keys))()
+            self._check(fn(self.h, inventory_out), "q27_cache_inventory")
+            result.update(zip(inventory_keys, inventory_out))
         return result
 
     def memory_report(self):

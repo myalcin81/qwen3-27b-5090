@@ -612,6 +612,7 @@ bool Model::evict_checkpoint(Eviction reason, bool host_only) {
 }
 
 void Model::erase_checkpoint(size_t index, Eviction reason) {
+  inventory_dirty_ = true;
   auto it = ckpts_.begin() + index;
   for (int32_t p : it->pages) cache_unref(p);
   slot_used_[it->slot] = false;
@@ -651,6 +652,7 @@ bool Model::relieve_kv_pressure() {
     return evict_checkpoint(Eviction::Host, true) || evict_checkpoint(Eviction::Gpu);
   }
   rebind_checkpoints(ckpts_, moved, [&](int p) { pool_.unref(p); }, [&](int h) { host_kv_.ref(h); });
+  inventory_dirty_ = true;
   for (const auto& [p, h] : moved) host_kv_.unref(h);  // transfer's temporary references
   cstats_.demoted += int64_t(moved.size());
   return true;
@@ -719,6 +721,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   ckpts_.push_back(std::move(ck));
+  inventory_dirty_ = true;
   cstats_.saved++;
 }
 
@@ -784,6 +787,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
       // checkpoint at once: repeated hits can then use GPU pages, with no stale host copy to maintain.
       Q27_CUDA(cudaStreamSynchronize(s_));
       rebind_checkpoints(ckpts_, restored, [&](int h) { host_kv_.unref(h); }, [&](int p) { pool_.ref(p); });
+      inventory_dirty_ = true;
     } catch (...) {
       cudaStreamSynchronize(s_);
       for (int p : seq_pages_) pool_.unref(p);
@@ -854,6 +858,20 @@ void Model::kv_host_stats(int64_t* out) const {
   out[3] = cstats_.demoted, out[4] = cstats_.restored;
   out[5] = cstats_.evicted_state, out[6] = cstats_.evicted_gpu, out[7] = cstats_.evicted_host;
   out[8] = host_kv_.failures();
+}
+
+void Model::cache_inventory_stats(int64_t* out) const {
+  if (inventory_dirty_) {
+    inventory_ = cache_inventory(ckpts_, kPageTokens);
+    inventory_dirty_ = false;
+  }
+  const auto& v = inventory_;
+  out[0] = v.unique_tokens, out[1] = v.logical_full_pages, out[2] = v.physical_full_pages;
+  out[3] = std::max(int64_t(0), v.physical_full_pages - v.logical_full_pages);
+  out[4] = v.page_references, out[5] = v.gpu_pages, out[6] = v.host_pages;
+  out[7] = host_kv_.used() - v.host_pages;  // stable observation: nonzero needs an ownership audit
+  out[8] = int64_t(host_kv_.used()) * int64_t(kv_page_bytes_ * kKvSlices);
+  out[9] = v.leaves;
 }
 
 std::string Model::memory_report() const {

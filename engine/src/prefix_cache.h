@@ -93,6 +93,47 @@ struct CacheStats {
   int64_t demoted = 0, restored = 0, evicted_state = 0, evicted_gpu = 0, evicted_host = 0;
 };
 
+struct CacheInventory {
+  int64_t unique_tokens = 0, logical_full_pages = 0, physical_full_pages = 0;
+  int64_t page_references = 0, gpu_pages = 0, host_pages = 0, leaves = 0;
+};
+
+// Token-prefix union, not sum(checkpoint lengths): ancestors and shared branches count only once. This is
+// diagnostic accounting, never a substitute for exact lookup or a license to deduplicate numerical state.
+inline CacheInventory cache_inventory(const std::vector<Checkpoint>& checkpoints, int page_tokens) {
+  CacheInventory out;
+  std::vector<const Checkpoint*> sorted;
+  std::set<int32_t> gpu, host, full;
+  for (const auto& c : checkpoints) {
+    sorted.push_back(&c);
+    out.page_references += int64_t(c.pages.size());
+    for (size_t i = 0; i < c.pages.size(); ++i) {
+      const int p = c.pages[i];
+      if (p > 0) gpu.insert(p);
+      if (p < 0) host.insert(p);
+      if (p && (i + 1) * size_t(page_tokens) <= c.ids.size()) full.insert(p);
+    }
+  }
+  std::sort(sorted.begin(), sorted.end(), [](const auto* a, const auto* b) { return a->ids < b->ids; });
+  const Checkpoint* previous = nullptr;
+  for (const auto* c : sorted) {
+    size_t shared = 0;
+    if (previous) {
+      const size_t end = std::min(previous->ids.size(), c->ids.size());
+      while (shared < end && previous->ids[shared] == c->ids[shared]) ++shared;
+      if (shared < previous->ids.size()) ++out.leaves;
+    }
+    out.unique_tokens += int64_t(c->ids.size() - shared);
+    out.logical_full_pages += c->pos() / page_tokens - int64_t(shared / page_tokens);
+    previous = c;
+  }
+  if (previous) ++out.leaves;
+  out.gpu_pages = int64_t(gpu.size());
+  out.host_pages = int64_t(host.size());
+  out.physical_full_pages = int64_t(full.size());
+  return out;
+}
+
 // Under state-slot pressure, retire redundant points of a prefix chain before its useful ends. In particular,
 // retain both the deepest prompt boundary (exact retries) and the generated continuation (the next turn).
 // Branch points stay useful to multiple descendants. Classification is only an eviction heuristic: actual

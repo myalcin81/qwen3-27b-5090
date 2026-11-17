@@ -39,10 +39,12 @@ def test_bad_submission_does_not_kill_other_requests():
 
 class FakeEngine:
     def __init__(self, free, ckpt_only=0, park=171):
+        self.inventory_requests = []
         self.st = {"free_pages": free, "checkpoint_only_pages": ckpt_only, "park_pages": park, "checkpoints": 0,
                    "evicted": 0}
 
-    def cache_stats(self):
+    def cache_stats(self, *, inventory=False):
+        self.inventory_requests.append(inventory)
         return dict(self.st)
 
 
@@ -143,7 +145,8 @@ def test_host_cached_tokens_still_require_gpu_room():
     assert not sch.kv_room(new)  # host pages are restore sources, not device capacity for an active request
 
 
-def test_host_cache_metrics_report_allocations_and_eviction_reasons():
+def test_host_cache_metrics_report_allocations_and_eviction_reasons(monkeypatch):
+    monkeypatch.delenv("Q27_CACHE_INVENTORY", raising=False)
     sch = scheduler(FakeEngine(free=1))
     sch.engine.st.update(kv_host_pages=7, kv_host_bytes=128, kv_host_budget_bytes=256,
                          kv_demoted_pages=13, kv_restored_pages=6, evicted_state=3, evicted_host=2)
@@ -152,6 +155,15 @@ def test_host_cache_metrics_report_allocations_and_eviction_reasons():
     assert out["q27:kv_demoted_pages_total"] == 13 and out["q27:kv_restored_pages_total"] == 6
     assert out['q27:prefix_cache_evictions_by_reason_total{reason="state"}'] == 3
     assert out['q27:prefix_cache_evictions_by_reason_total{reason="host"}'] == 2
+    assert "q27:prefix_unique_tokens" not in out  # an old engine's inventory is unknown
+    assert sch.engine.inventory_requests == [False]
+    monkeypatch.setenv("Q27_CACHE_INVENTORY", "1")
+    sch.engine.st.update(prefix_unique_tokens=1234, prefix_duplicate_full_pages=2,
+                         kv_host_unreferenced_pages=0, kv_host_used_bytes=96)
+    out = sch.metrics()
+    assert sch.engine.inventory_requests == [False, True]
+    assert out["q27:prefix_unique_tokens"] == 1234 and out["q27:prefix_duplicate_full_pages"] == 2
+    assert out["q27:kv_host_unreferenced_pages"] == 0 and out["q27:kv_host_used_bytes"] == 96
 
 
 def test_parked_request_already_holds_its_area():

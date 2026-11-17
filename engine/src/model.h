@@ -144,6 +144,7 @@ class Model {
   // slots allocated.
   void cache_stats(int64_t* out) const;
   void kv_host_stats(int64_t* out) const;  // out[9], separate from the stable cache_stats ABI
+  void cache_inventory_stats(int64_t* out) const;  // optional out[10], union and physical ownership
   // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
@@ -342,6 +343,8 @@ class Model {
   std::vector<int32_t> boundaries_;  // explicit positions in plan_ (intervals are not prompt boundaries)
   uint64_t use_clock_ = 0;
   CacheStats cstats_;
+  mutable bool inventory_dirty_ = true;
+  mutable CacheInventory inventory_;
   int32_t* pos_dev_ = nullptr;       // == pos_ between calls; read by the attention kernels
   float* conv_ = nullptr;            // [48][10240][3]
   float* ssm_ = nullptr;             // [48][48][128][128]: the current buffer (ssm_buf_[sbuf_host_])

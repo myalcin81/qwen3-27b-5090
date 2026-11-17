@@ -371,6 +371,11 @@ int q27_kv_host_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->kv_host_stats(out); });
 }
 
+// Optional 10-field prefix union/ownership inventory. The original 12- and 9-field APIs stay unchanged.
+int q27_cache_inventory(void* m, int64_t* out) {
+  return guard([&] { static_cast<Model*>(m)->cache_inventory_stats(out); });
+}
+
 // Allocates up to n more pinned state slots of the prefix cache (*added: how many; 0 once all are).
 int q27_cache_grow(void* m, int n, int* added) {
   return guard([&] { *added = static_cast<Model*>(m)->grow_state_cache(n); });

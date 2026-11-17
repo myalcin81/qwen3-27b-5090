@@ -370,6 +370,31 @@ ordering heuristic, while `prefix_begin` supplies the actual hit count.
 three resources (each emitted series has a single reason). The original twelve-value `q27_cache_stats` ABI is
 unchanged; host counters have a separate optional entry point, so Python can still load older engine builds.
 
+With `Q27_CACHE_INVENTORY=1`, the optional ten-value `q27_cache_inventory` entry point adds the following gauges
+to `/metrics`. This diagnostic is off by default to avoid scan overhead in normal traffic. The gauges describe
+surviving checkpoints, not all prompts ever requested or the active/parked sequences without a checkpoint:
+
+| Metric (with `q27:` prefix) | Meaning |
+|---|---|
+| `prefix_unique_tokens` | Token-prefix union across retained checkpoints; shared ancestors count once |
+| `prefix_logical_full_pages` | Complete pages in that union, counting a branch only after its full common pages |
+| `prefix_physical_full_pages` | Distinct physical GPU/host pages covering complete checkpoint pages |
+| `prefix_duplicate_full_pages` | Positive excess of physical over logical full pages; excludes partial-page copies |
+| `prefix_page_references` | Total page references across checkpoints, including shared pages repeatedly |
+| `prefix_gpu_pages`, `prefix_host_pages` | Distinct physical GPU/host pages referenced by checkpoints, including partial pages |
+| `kv_host_unreferenced_pages` | Live host pages absent from the checkpoint inventory; expected zero between engine operations |
+| `kv_host_used_bytes` | Bytes occupied by live host pages, excluding reusable free space in allocated slabs |
+| `prefix_leaves` | Maximal distinct retained token prefixes (ancestor checkpoints and equal-token variants count once) |
+
+Inventory is recomputed after checkpoint/page membership changes and reused otherwise. Python requests it only
+for opted-in metrics (`Engine.cache_stats(inventory=True)`), keeping token-history scans out of admission queries. Older
+native libraries omit these gauges instead of reporting unknown measurements as zero. A positive duplicate count
+does not prove a leak or numerical equivalence: ring variants and different compute paths may require distinct
+state. This accounting never deduplicates storage. Use `kv_host_used_bytes`, allocated `kv_host_bytes` and the
+budget together when diagnosing capacity. Workload size must be measured from actual token sequences; the
+scheduler's `reusable` counter excludes unseen cold prefixes, so dividing it by the total number of replay rounds
+can underestimate the working set.
+
 Validation on a deployment requires both forced-eviction byte/token parity and a workload larger than the GPU
 pool. CPU ownership tests do not establish GPU correctness or a TTFT/throughput improvement. The host budget is
 in addition to state, embeddings and other process RAM; allocation is bounded and lazy, not a promise that all
