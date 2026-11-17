@@ -320,13 +320,91 @@ convolution, the draft's context ring: 189.9 MiB).
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
 - **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 4 GiB = 21 checkpoints). Saving copies the
   state to one staging buffer on the GPU and then to the host on a copy stream; restoring copies from the host
-  (4 to 6 ms). Eviction is LRU, and the KV pool also reclaims pages from the least recently used checkpoints.
-- **Lookup** is a linear scan with `memcmp` over the token sequences; there are at most a few dozen checkpoints.
+  (4 to 6 ms). Under state-slot pressure, covered intermediates go before independent prefix ends; ties use LRU.
+  GPU/host KV pressure retains its separate LRU policy.
+- **Lookup** is a linear scan with `memcmp` over the token sequences; its size is bounded by the state budget.
 - **Exactness**: the state is kept in FP32 and the boundaries follow the GDN chunks, so a request resumed from a
   checkpoint produces exactly the tokens it would produce without the cache (`scripts/prefix_cache_test.py`).
 
 An agent's turn after a 20K-token conversation reaches its first token in about 0.2 s: everything but the new tool
 output and user message comes from the cache.
+
+### Optional host KV tier
+
+`KV_HOST_CACHE` defaults to zero. A positive budget retains attention KV pages in pinned host RAM when the GPU
+pool fills. This is separate from `STATE_HOST_CACHE`, which still limits how many GDN/conv/draft checkpoints can
+survive. Increasing only one budget cannot remove pressure on the other. For example, 16 GiB of state is roughly
+86 draft-enabled checkpoints, not 86 conversations: each conversation may save several checkpoints.
+
+When all state slots are occupied, eviction classifies the existing checkpoints plus the pending save as a
+compressed prefix tree. Covered non-boundary intermediates are cheapest, followed by earlier prompt boundaries
+covered by a deeper boundary. The deepest prompt boundary (retry) and generated continuation (next turn) survive
+preferentially, as do known branch points with multiple children. A plain descendant never makes a speculative
+checkpoint redundant. LRU breaks ties and remains the fallback when independent useful prefixes exceed capacity.
+If an optional interval has no cheap victim, its save is skipped; its prefill cut is unchanged, preserving numerical
+paths. Explicit boundary metadata follows sequences through parking. With spare slots, intervals are kept as
+before. This policy applies with or without host KV. State eviction counters include these cheap removals, so
+interpret them alongside actual cache hits, host restores and latency rather than assuming every removal loses a
+session. CPU tests cover a 40-session/86-slot retention fixture; GPU correctness and real workload acceptance are
+separate checks.
+
+Checkpoint page references are positive GPU page IDs or negative host-slot IDs. Only pages owned exclusively by
+checkpoints may move to RAM. Every checkpoint sharing a page is rebound to its single immutable host copy; a GPU
+page ID can then be recycled safely. Up to 256 pages are copied per pressure-relief batch on the engine stream,
+which is fenced before any source page can be reused. This first implementation deliberately fences transfers;
+overlap and transfer latency must be evaluated on the target GPU before changing that ordering.
+
+On a hit, the engine first restores the matching state and draft context, then retains all source pages while it
+allocates device pages. Full host pages are restored and rebound to all surviving sharing checkpoints. A partial
+last page always gets a private device copy; the checkpoint keeps its immutable source. H2D completes before host
+slots return to the free list. A failed restore releases its temporary references and device pages before the
+scheduler retries. Parking/video pool compaction remaps positive page references only.
+
+Admission still accounts for **device** capacity for the complete resumed context: host cached tokens cannot be
+subtracted from the device pages required by a new sequence. The existing `est_cached` estimate remains an
+ordering heuristic, while `prefix_begin` supplies the actual hit count.
+
+`q27:kv_host_pages` counts live host pages; `q27:kv_host_bytes` includes reusable allocated slabs, and
+`q27:kv_host_budget_bytes` is the rounded capacity. Demotion/restoration and allocation-failure counters use the
+`_total` suffix. `q27:prefix_cache_evictions_by_reason_total{reason="state|gpu|host"}` distinguishes pressure on the
+three resources (each emitted series has a single reason). The original twelve-value `q27_cache_stats` ABI is
+unchanged; host counters have a separate optional entry point, so Python can still load older engine builds.
+
+With `Q27_CACHE_INVENTORY=1`, the optional ten-value `q27_cache_inventory` entry point adds the following gauges
+to `/metrics`. This diagnostic is off by default to avoid scan overhead in normal traffic. The gauges describe
+surviving checkpoints, not all prompts ever requested or the active/parked sequences without a checkpoint:
+
+| Metric (with `q27:` prefix) | Meaning |
+|---|---|
+| `prefix_unique_tokens` | Token-prefix union across retained checkpoints; shared ancestors count once |
+| `prefix_logical_full_pages` | Complete pages in that union, counting a branch only after its full common pages |
+| `prefix_physical_full_pages` | Distinct physical GPU/host pages covering complete checkpoint pages |
+| `prefix_duplicate_full_pages` | Positive excess of physical over logical full pages; excludes partial-page copies |
+| `prefix_page_references` | Total page references across checkpoints, including shared pages repeatedly |
+| `prefix_gpu_pages`, `prefix_host_pages` | Distinct physical GPU/host pages referenced by checkpoints, including partial pages |
+| `kv_host_unreferenced_pages` | Live host pages absent from the checkpoint inventory; expected zero between engine operations |
+| `kv_host_used_bytes` | Bytes occupied by live host pages, excluding reusable free space in allocated slabs |
+| `prefix_leaves` | Maximal distinct retained token prefixes (ancestor checkpoints and equal-token variants count once) |
+
+Inventory is recomputed after checkpoint/page membership changes and reused otherwise. Python requests it only
+for opted-in metrics (`Engine.cache_stats(inventory=True)`), keeping token-history scans out of admission queries. Older
+native libraries omit these gauges instead of reporting unknown measurements as zero. A positive duplicate count
+does not prove a leak or numerical equivalence: ring variants and different compute paths may require distinct
+state. This accounting never deduplicates storage. Use `kv_host_used_bytes`, allocated `kv_host_bytes` and the
+budget together when diagnosing capacity. Workload size must be measured from actual token sequences; the
+scheduler's `reusable` counter excludes unseen cold prefixes, so dividing it by the total number of replay rounds
+can underestimate the working set.
+
+Validation on a deployment requires both forced-eviction byte/token parity and a workload larger than the GPU
+pool. CPU ownership tests do not establish GPU correctness or a TTFT/throughput improvement. The host budget is
+in addition to state, embeddings and other process RAM; allocation is bounded and lazy, not a promise that all
+configured memory is available. NVFP4 occupies 1.125 MiB per 64-token page across all attention layers; FP8 uses
+2 MiB and BF16 4 MiB.
+
+Budget for the unique retained prefixes plus generated continuations and temporary restore copies. A cyclic scan
+just larger than the GPU/host capacity can have very few LRU hits even though most prefixes fit at each snapshot.
+The [native Linux replay evaluation](results/20261118-host-kv.md) records this distinction and the tested budgets;
+it does not change the default host budget or promise the same latency for every working set.
 
 ## 10. Scheduler and concurrency
 

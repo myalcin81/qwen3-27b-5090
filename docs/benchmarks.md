@@ -118,6 +118,9 @@ The KV pool holds 601,856 tokens with the defaults (605,504 with `SPEC=dflash2`:
 use the full 262,144-token context; the scheduler admits a new request only when the free KV cache can hold its prompt
 plus 4,096 output tokens, so eight long requests wait in line instead of evicting each other.
 
+The optional host KV tier has a separate [native Linux capacity and replay evaluation](results/20261118-host-kv.md),
+with its own hardware conditions, memory budgets and acceptance results.
+
 ### Reproduce
 
 ```bash

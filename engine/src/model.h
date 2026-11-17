@@ -11,6 +11,7 @@
 #include "kernels.h"
 #include "memory.h"
 #include "prefix_cache.h"
+#include "host_kv.h"
 #include "safetensors.h"
 #include "vision.h"
 #include "weights.h"
@@ -28,6 +29,7 @@ struct Options {
   // pool (0: what the VRAM budget leaves; without the cache, max_tokens) and the interval of the
   // checkpoints inside long prompts.
   double state_cache_gib = 0;
+  double kv_host_cache_gib = 0;  // bounded pinned host KV tier; 0 keeps the GPU-only cache
   int kv_pool_tokens = 0;
   int checkpoint_interval = 8192;
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
@@ -141,6 +143,8 @@ class Model {
   // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area, state
   // slots allocated.
   void cache_stats(int64_t* out) const;
+  void kv_host_stats(int64_t* out) const;  // out[9], separate from the stable cache_stats ABI
+  void cache_inventory_stats(int64_t* out) const;  // optional out[10], union and physical ownership
   // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
@@ -221,12 +225,17 @@ class Model {
   // Writes physical pages to a device page table (as the kernels read it: page * kKvSlices, P7-13).
   void upload_pages(int32_t* table, const int32_t* pages, size_t n);
   void release_seq();                // returns the running sequence's pages
-  void save_checkpoint(bool ring);   // at pos_ (nothing pending)
+  void save_checkpoint(bool ring, bool boundary = false, bool interval = false); // at pos_ (nothing pending)
   // A checkpoint of tokens ids (pages: their KV pages) whose state is in a parking area (null: the running sequence's).
   void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
-                            bool ring);
+                              bool ring, bool boundary = false, bool interval = false);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
-  bool evict_checkpoint();           // the least recently used one; false when there is none
+  enum class Eviction { State, Gpu, Host };
+  bool evict_checkpoint(Eviction reason, bool host_only = false);
+  void erase_checkpoint(size_t index, Eviction reason);
+  bool relieve_kv_pressure();        // demote checkpoint-only pages, or evict when the host tier is full
+  void cache_ref(int p) { if (p > 0) pool_.ref(p); else host_kv_.ref(p); }
+  void cache_unref(int p) { if (p > 0) pool_.unref(p); else host_kv_.unref(p); }
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
   // Captures body; with update, updates that graph in place when only arguments / grids differ (else replaces it).
@@ -323,6 +332,7 @@ class Model {
   // Prefix cache.
   bool cache_on_ = false;
   std::vector<Checkpoint> ckpts_;
+  HostKvPages host_kv_;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring
   std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;
@@ -330,8 +340,11 @@ class Model {
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
+  std::vector<int32_t> boundaries_;  // explicit positions in plan_ (intervals are not prompt boundaries)
   uint64_t use_clock_ = 0;
   CacheStats cstats_;
+  mutable bool inventory_dirty_ = true;
+  mutable CacheInventory inventory_;
   int32_t* pos_dev_ = nullptr;       // == pos_ between calls; read by the attention kernels
   float* conv_ = nullptr;            // [48][10240][3]
   float* ssm_ = nullptr;             // [48][48][128][128]: the current buffer (ssm_buf_[sbuf_host_])
@@ -359,7 +372,7 @@ class Model {
     char* dev = nullptr;  // the device area
     bool used = false;
     int pos = 0;
-    std::vector<int32_t> pages, ids, plan;
+    std::vector<int32_t> pages, ids, plan, boundaries;
     std::vector<MmSpan> mm;
     int32_t spec_last = -1;
     bool ring_valid = false;

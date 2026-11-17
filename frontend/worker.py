@@ -928,7 +928,7 @@ class Scheduler:
 
     def metrics(self):
         self.last_metrics = time.time()
-        st = self.engine.cache_stats()
+        st = self.engine.cache_stats(inventory=os.environ.get("Q27_CACHE_INVENTORY") == "1")
         out = dict(self.m)
         out.update({"q27:num_requests_running": len(self.alive), "q27:num_requests_waiting": len(self.waiting),
                     "q27:target_seqs": self.max_seqs, "q27:engine_seqs": self.engine_seqs,
@@ -936,6 +936,17 @@ class Scheduler:
                     'q27:admission_blocked{reason="speed"}': int(self.blocked == "speed"),
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
+        for key in ("kv_host_pages", "kv_host_bytes", "kv_host_budget_bytes"):
+            out[f"q27:{key}"] = st.get(key, 0)
+        for key in ("kv_demoted_pages", "kv_restored_pages", "kv_host_alloc_failures"):
+            out[f"q27:{key}_total"] = st.get(key, 0)
+        for key in ("prefix_unique_tokens", "prefix_logical_full_pages", "prefix_physical_full_pages",
+                    "prefix_duplicate_full_pages", "prefix_page_references", "prefix_gpu_pages",
+                    "prefix_host_pages", "kv_host_unreferenced_pages", "kv_host_used_bytes", "prefix_leaves"):
+            if key in st:  # old native libraries do not report unknown measurements as zero
+                out[f"q27:{key}"] = st[key]
+        for reason in ("state", "gpu", "host"):
+            out[f'q27:prefix_cache_evictions_by_reason_total{{reason="{reason}"}}'] = st.get(f"evicted_{reason}", 0)
         return out
 
 

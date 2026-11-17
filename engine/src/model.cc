@@ -6,6 +6,8 @@
 #include <cstring>
 #include <fstream>
 #include <iterator>
+#include <limits>
+#include <map>
 #include <numeric>
 #include <tuple>
 #include <vector>
@@ -181,6 +183,23 @@ Model::Model(const Options& opt) : opt_(opt) {
   // no sequence is parked there; seq_park moves them out (reserve_area).
   Q27_CHECK(opt.park_slots >= 0 && opt.park_slots <= 15, "park_slots: 0 .. 15");
   const size_t per_page = 2 * kAttnLayers * kv_page_bytes_;
+  Q27_CHECK(std::isfinite(opt.kv_host_cache_gib) && opt.kv_host_cache_gib >= 0,
+            "KV_HOST_CACHE must be a finite, nonnegative GiB value");
+  Q27_CHECK(opt.kv_host_cache_gib == 0 || cache_on_, "KV_HOST_CACHE requires STATE_HOST_CACHE > 0");
+  const double host_pages = opt.kv_host_cache_gib * double(size_t(1) << 30) / double(per_page);
+  Q27_CHECK(host_pages <= double(std::numeric_limits<int>::max() - 1), "KV_HOST_CACHE is too large");
+  host_kv_.init(int(host_pages), per_page, [](size_t bytes) -> char* {
+    char* mem = nullptr;
+    const auto err = cudaHostAlloc(reinterpret_cast<void**>(&mem), bytes, cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+      if (err != cudaErrorMemoryAllocation) Q27_CUDA(err);
+      cudaGetLastError();  // allocation failure is recoverable: retain the existing tier and evict normally
+      log("host KV pinning failed; further growth disabled for this engine instance");
+      return nullptr;
+    }
+    return mem;
+  }, [](char* mem) { cudaFreeHost(mem); });
+  if (host_kv_.capacity()) host_cache_.add("KV pages (lazy)", host_kv_.budget());
   park_pages_ = int(round_up(ceil_div(ckpt_bytes_, per_page), kv_block_));
   const int park_all = opt.park_slots * park_pages_;
 
@@ -535,6 +554,7 @@ void Model::reset() {
   spec_pending_ = false;
   release_seq();
   plan_.clear();
+  boundaries_.clear();
   ring_valid_ = false;
   spec_last_ = -1;
   Q27_CUDA(cudaStreamSynchronize(s_));
@@ -567,7 +587,7 @@ void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tok
   const int want = std::min(max_pages_, need + 8);
   while (int(pages.size()) < want) {
     int p = pool_.alloc();
-    while (p < 0 && int(pages.size()) < need && evict_checkpoint()) p = pool_.alloc();
+    while (p < 0 && int(pages.size()) < need && relieve_kv_pressure()) p = pool_.alloc();
     if (p < 0) {
       if (int(pages.size()) < need) {  // (the pages taken so far stay with the sequence)
         upload_pages(table + have, pages.data() + have, pages.size() - have);
@@ -580,14 +600,61 @@ void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tok
   upload_pages(table + have, pages.data() + have, pages.size() - have);
 }
 
-bool Model::evict_checkpoint() {
-  if (ckpts_.empty()) return false;
-  auto it = std::min_element(ckpts_.begin(), ckpts_.end(),
-                             [](const Checkpoint& a, const Checkpoint& b) { return a.last_use < b.last_use; });
-  for (int32_t p : it->pages) pool_.unref(p);
+bool Model::evict_checkpoint(Eviction reason, bool host_only) {
+  auto it = ckpts_.end();
+  for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c) {
+    if (host_only && std::none_of(c->pages.begin(), c->pages.end(), [](int p) { return p < 0; })) continue;
+    if (it == ckpts_.end() || c->last_use < it->last_use) it = c;
+  }
+  if (it == ckpts_.end()) return false;
+  erase_checkpoint(size_t(it - ckpts_.begin()), reason);
+  return true;
+}
+
+void Model::erase_checkpoint(size_t index, Eviction reason) {
+  inventory_dirty_ = true;
+  auto it = ckpts_.begin() + index;
+  for (int32_t p : it->pages) cache_unref(p);
   slot_used_[it->slot] = false;
   ckpts_.erase(it);
   cstats_.evicted++;
+  if (reason == Eviction::State) cstats_.evicted_state++;
+  else if (reason == Eviction::Host) cstats_.evicted_host++;
+  else cstats_.evicted_gpu++;
+}
+
+bool Model::relieve_kv_pressure() {
+  if (!host_kv_.capacity()) return evict_checkpoint(Eviction::Gpu);
+  const auto candidates = demotion_batch(ckpts_, pool_);
+  // No checkpoint-only GPU page: removing a checkpoint cannot free a GPU page. The scheduler must
+  // suspend an active sequence; don't throw away useful host checkpoints in an unsuccessful search.
+  if (candidates.empty()) return false;
+  std::map<int, int> moved;  // GPU -> host; every sharing checkpoint is rebound to the single host copy
+  try {
+    for (int p : candidates) {
+      const int h = host_kv_.alloc();
+      if (!h) break;
+      try { moved.emplace(p, h); }
+      catch (...) { host_kv_.unref(h); throw; }
+      Q27_CUDA(cudaMemcpy2DAsync(host_kv_.data(h), kv_page_bytes_, kv_page(p, 0),
+                                 size_t(kv_block_) * kv_page_bytes_, kv_page_bytes_, kKvSlices,
+                                 cudaMemcpyDeviceToHost, s_));
+    }
+    if (!moved.empty()) Q27_CUDA(cudaStreamSynchronize(s_));
+  } catch (...) {
+    cudaStreamSynchronize(s_);  // no slot is reused while a queued transfer may still access it
+    for (const auto& [p, h] : moved) host_kv_.unref(h);
+    throw;
+  }
+  if (moved.empty()) {
+    // Host capacity/pinning pressure: retire whole LRU checkpoints (state + KV together). Several
+    // checkpoints may share a host page, so a caller may need more than one eviction before it is free.
+    return evict_checkpoint(Eviction::Host, true) || evict_checkpoint(Eviction::Gpu);
+  }
+  rebind_checkpoints(ckpts_, moved, [&](int p) { pool_.unref(p); }, [&](int h) { host_kv_.ref(h); });
+  inventory_dirty_ = true;
+  for (const auto& [p, h] : moved) host_kv_.unref(h);  // transfer's temporary references
+  cstats_.demoted += int64_t(moved.size());
   return true;
 }
 
@@ -602,35 +669,45 @@ int Model::grow_state_cache(int n) {
   return added;
 }
 
-void Model::save_checkpoint(bool ring) {
+void Model::save_checkpoint(bool ring, bool boundary, bool interval) {
   if (!cache_on_ || pos_ == 0) return;
   Q27_CHECK(int(seq_ids_.size()) == pos_, "checkpoint: token history does not match the position");
-  save_checkpoint_from(nullptr, seq_ids_, seq_pages_, ring);
+  save_checkpoint_from(nullptr, seq_ids_, seq_pages_, ring, boundary, interval);
 }
 
 void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
-                                 bool ring) {
+                                 bool ring, bool boundary, bool interval) {
   const int pos = int(ids.size());
   if (!cache_on_ || pos == 0) return;
   for (auto& c : ckpts_)
-    if (c.pos() == pos && c.ring >= ring && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
-      c.last_use = ++use_clock_;
-      return;
+    if (c.pos() == pos && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
+      boundary |= c.boundary;  // a speculative upgrade inherits the plain checkpoint's prompt role
+      if (c.ring >= ring) {
+        c.last_use = ++use_clock_;
+        c.boundary = boundary;
+        return;
+      }
     }
-  // A free allocated slot; else allocate another one; else evict the least recently used checkpoint.
+  Checkpoint ck;
+  ck.ids = ids;
+  ck.ring = ring;
+  ck.boundary = boundary;
+  // Keep opportunistic intervals while slots are available. Under pressure reclaim covered intermediates
+  // first; if only useful ends/branch points remain, skip an interval instead of evicting another session.
   int slot = -1;
   for (;;) {
     for (size_t i = 0; i < slot_used_.size() && slot < 0; i++)
       if (slot_mem_[i] && !slot_used_[i]) slot = int(i);
     if (slot >= 0) break;
-    if (!grow_state_cache(1) && !evict_checkpoint()) fail("checkpoint: no state slot");
+    if (!grow_state_cache(1)) {
+      const int victim = state_eviction_index(ckpts_, ck, interval);
+      if (victim < 0) return;
+      erase_checkpoint(size_t(victim), Eviction::State);
+    }
   }
-  Checkpoint ck;
-  ck.ids = ids;
   ck.pages.assign(pages.begin(), pages.begin() + ceil_div(pos, kPageTokens));
   for (int32_t p : ck.pages) pool_.ref(p);
   ck.slot = slot;
-  ck.ring = ring;
   ck.last_use = ++use_clock_;
   slot_used_[slot] = true;
   // State -> staging (device, fast) -> host slot on the copy stream, overlapping what follows.
@@ -644,6 +721,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   ckpts_.push_back(std::move(ck));
+  inventory_dirty_ = true;
   cstats_.saved++;
 }
 
@@ -672,26 +750,55 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
       Q27_CUDA(cudaMemcpyAsync(draft_->ring_v(), src + ssm_bytes_ + conv_bytes_ + rb, rb, cudaMemcpyHostToDevice, s_));
     }
     Q27_CUDA(cudaStreamSynchronize(s_));
-    // Full pages are shared; the partial last page is copied (the sequence writes its later rows).
+    // Keep a temporary reference to every source: pressure relief below may evict the chosen checkpoint.
+    // Host references never masquerade as GPU capacity; the resumed sequence needs real GPU pages too.
     const int full = cached / kPageTokens;
-    std::vector<int32_t> pages = best->pages;
-    for (int32_t p : pages) pool_.ref(p);
-    seq_pages_.assign(pages.begin(), pages.begin() + full);
-    seq_ids_.assign(ids, ids + cached);
-    ring_valid_ = best->ring;
-    best = nullptr;  // (may be evicted below)
-    if (full < int(pages.size())) {
-      int p = pool_.alloc();
-      while (p < 0 && evict_checkpoint()) p = pool_.alloc();
-      if (p < 0) {  // (the caller retries after another sequence gave pages back; this one is reset then)
-        for (size_t i = full; i < pages.size(); i++) pool_.unref(pages[i]);
-        throw KvFull("KV pool exhausted");
+    const std::vector<int32_t> pages = best->pages;
+    const bool ring = best->ring;
+    for (int p : pages) cache_ref(p);
+    best = nullptr;
+    std::map<int, int> restored;  // full host pages -> GPU; partial last pages stay private to this sequence
+    int64_t restored_count = 0;
+    try {
+      seq_pages_.reserve(pages.size());
+      for (size_t i = 0; i < pages.size(); i++) {
+        const int src_page = pages[i];
+        if (src_page > 0 && int(i) < full) {
+          pool_.ref(src_page);
+          seq_pages_.push_back(src_page);
+          continue;
+        }
+        int p = pool_.alloc();
+        while (p < 0 && relieve_kv_pressure()) p = pool_.alloc();
+        if (p < 0) throw KvFull("KV pool exhausted (prefix restore)");
+        seq_pages_.push_back(p);
+        const size_t pitch = size_t(kv_block_) * kv_page_bytes_;
+        if (src_page < 0) {
+          Q27_CUDA(cudaMemcpy2DAsync(kv_page(p, 0), pitch, host_kv_.data(src_page), kv_page_bytes_,
+                                     kv_page_bytes_, kKvSlices, cudaMemcpyHostToDevice, s_));
+          if (int(i) < full) restored.emplace(src_page, p);
+          restored_count++;
+        } else {
+          Q27_CUDA(cudaMemcpy2DAsync(kv_page(p, 0), pitch, kv_page(src_page, 0), pitch,
+                                     kv_page_bytes_, kKvSlices, cudaMemcpyDeviceToDevice, s_));
+        }
       }
-      for (int sl = 0; sl < kKvSlices; sl++)
-        Q27_CUDA(cudaMemcpyAsync(kv_page(p, sl), kv_page(pages[full], sl), kv_page_bytes_, cudaMemcpyDeviceToDevice, s_));
-      seq_pages_.push_back(p);
+      // Do not return a host slot to the free list until all H2D readers are done. Rebind every sharing
+      // checkpoint at once: repeated hits can then use GPU pages, with no stale host copy to maintain.
+      Q27_CUDA(cudaStreamSynchronize(s_));
+      rebind_checkpoints(ckpts_, restored, [&](int h) { host_kv_.unref(h); }, [&](int p) { pool_.ref(p); });
+      inventory_dirty_ = true;
+    } catch (...) {
+      cudaStreamSynchronize(s_);
+      for (int p : seq_pages_) pool_.unref(p);
+      seq_pages_.clear();
+      for (int p : pages) cache_unref(p);
+      throw;
     }
-    for (size_t i = full; i < pages.size(); i++) pool_.unref(pages[i]);
+    for (int p : pages) cache_unref(p);
+    cstats_.restored += restored_count;
+    seq_ids_.assign(ids, ids + cached);
+    ring_valid_ = ring;
     upload_pages(page_table_, seq_pages_.data(), seq_pages_.size());
     pos_ = cached;
     Q27_CUDA(cudaMemcpyAsync(pos_dev_, &pos_, 4, cudaMemcpyHostToDevice, s_));
@@ -709,6 +816,13 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     if (const int32_t p = at[i] / kGdnChunk * kGdnChunk; p > cached && p < n) plan_.push_back(p);
   std::sort(plan_.begin(), plan_.end());
   plan_.erase(std::unique(plan_.begin(), plan_.end()), plan_.end());
+  boundaries_ = plan_;
+  // An existing checkpoint can become an explicitly requested shared/retry point on a later request.
+  // Preserve that role even when this prefill resumes beyond it and will not save the point again.
+  for (auto& c : ckpts_)
+    for (int i = 0; i < nat; ++i)
+      if (c.pos() == at[i] / kGdnChunk * kGdnChunk && c.pos() < n &&
+          std::equal(c.ids.begin(), c.ids.end(), ids)) { c.boundary = true; break; }
   if (const int iv = opt_.checkpoint_interval; iv > 0) {
     std::vector<int32_t> fixed = plan_;
     fixed.push_back(cached);
@@ -732,12 +846,32 @@ void Model::cache_stats(int64_t* out) const {
   out[4] = cstats_.saved, out[5] = cstats_.evicted, out[6] = int64_t(ckpts_.size()), out[7] = pool_.free_pages();
   // A page only checkpoints hold has as many references as checkpoints listing it (the scheduler counts these
   // as room for a new request, P7-14).
-  std::vector<int32_t> n(pool_.pages(), 0);
+  const auto n = checkpoint_refs(ckpts_, pool_.pages());
   int64_t ckpt_only = 0;
-  for (const auto& c : ckpts_)
-    for (int32_t p : c.pages) ckpt_only += ++n[p] == pool_.refs(p);
+  for (int p = 1; p < pool_.pages(); p++) ckpt_only += n[p] > 0 && n[p] == pool_.refs(p);
   out[8] = ckpt_only, out[9] = pool_.pages() - 1, out[10] = park_pages_;
   out[11] = int64_t(std::count_if(slot_mem_.begin(), slot_mem_.end(), [](char* m) { return m != nullptr; }));
+}
+
+void Model::kv_host_stats(int64_t* out) const {
+  out[0] = host_kv_.used(), out[1] = int64_t(host_kv_.bytes()), out[2] = int64_t(host_kv_.budget());
+  out[3] = cstats_.demoted, out[4] = cstats_.restored;
+  out[5] = cstats_.evicted_state, out[6] = cstats_.evicted_gpu, out[7] = cstats_.evicted_host;
+  out[8] = host_kv_.failures();
+}
+
+void Model::cache_inventory_stats(int64_t* out) const {
+  if (inventory_dirty_) {
+    inventory_ = cache_inventory(ckpts_, kPageTokens);
+    inventory_dirty_ = false;
+  }
+  const auto& v = inventory_;
+  out[0] = v.unique_tokens, out[1] = v.logical_full_pages, out[2] = v.physical_full_pages;
+  out[3] = std::max(int64_t(0), v.physical_full_pages - v.logical_full_pages);
+  out[4] = v.page_references, out[5] = v.gpu_pages, out[6] = v.host_pages;
+  out[7] = host_kv_.used() - v.host_pages;  // stable observation: nonzero needs an ownership audit
+  out[8] = int64_t(host_kv_.used()) * int64_t(kv_page_bytes_ * kKvSlices);
+  out[9] = v.leaves;
 }
 
 std::string Model::memory_report() const {
@@ -1368,7 +1502,10 @@ int Model::prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, 
     seq_ids_.insert(seq_ids_.end(), ids + c0, ids + c0 + T);
     ring_valid_ = cap_ != nullptr;
     if (!plan_.empty() && plan_.front() <= pos_) {
-      if (plan_.front() == pos_) save_checkpoint(ring_valid_);
+      if (plan_.front() == pos_) {
+        const bool boundary = std::binary_search(boundaries_.begin(), boundaries_.end(), pos_);
+        save_checkpoint(ring_valid_, boundary, !boundary);
+      }
       while (!plan_.empty() && plan_.front() <= pos_) plan_.erase(plan_.begin());
     }
     c0 += T;
@@ -1897,11 +2034,12 @@ void Model::seq_take(SeqState& st) {
   st.pages = std::move(seq_pages_);
   st.ids = std::move(seq_ids_);
   st.plan = std::move(plan_);
+  st.boundaries = std::move(boundaries_);
   st.mm = std::move(mm_spans_);
   st.spec_last = spec_last_;
   st.ring_valid = ring_valid_;
   st.smp = spec_smp_;
-  seq_pages_.clear(), seq_ids_.clear(), plan_.clear(), mm_spans_.clear();
+  seq_pages_.clear(), seq_ids_.clear(), plan_.clear(), boundaries_.clear(), mm_spans_.clear();
   pos_ = 0;
   spec_last_ = -1;
   ring_valid_ = false;
@@ -1913,11 +2051,12 @@ void Model::seq_give(SeqState& st) {
   seq_pages_ = std::move(st.pages);
   seq_ids_ = std::move(st.ids);
   plan_ = std::move(st.plan);
+  boundaries_ = std::move(st.boundaries);
   mm_spans_ = std::move(st.mm);
   spec_last_ = st.spec_last;
   ring_valid_ = st.ring_valid;
   spec_smp_ = st.smp;
-  st.pages.clear(), st.ids.clear(), st.plan.clear(), st.mm.clear();
+  st.pages.clear(), st.ids.clear(), st.plan.clear(), st.boundaries.clear(), st.mm.clear();
   if (!seq_pages_.empty())
     upload_pages(page_table_, seq_pages_.data(), seq_pages_.size());
   Q27_CUDA(cudaMemcpyAsync(pos_dev_, &pos_, 4, cudaMemcpyHostToDevice, s_));
@@ -1937,7 +2076,7 @@ void Model::reserve_range(int lo, int hi) {
     return v;
   };
   std::vector<int32_t> moved = held();
-  while (pool_.free_outside(lo, hi) < int(moved.size()) && evict_checkpoint()) moved = held();
+  while (pool_.free_outside(lo, hi) < int(moved.size()) && relieve_kv_pressure()) moved = held();
   if (pool_.free_outside(lo, hi) < int(moved.size())) throw KvFull("KV pool exhausted (parking area)");
   if (!moved.empty()) {
     batch_exit();  // (the lanes' page tables are uploaded when a batch starts)
@@ -2082,7 +2221,7 @@ void Model::seq_drop(int a) {
   batch_exit();
   SeqState& st = parked_[a];
   for (int32_t p : st.pages) pool_.unref(p);
-  st.pages.clear(), st.ids.clear(), st.plan.clear(), st.mm.clear();
+  st.pages.clear(), st.ids.clear(), st.plan.clear(), st.boundaries.clear(), st.mm.clear();
   st.used = false;
   release_area(a);
 }
