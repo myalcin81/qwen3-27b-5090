@@ -43,6 +43,7 @@ sys.path.insert(0, str(ROOT / "engine/python"))
 sys.path.insert(0, str(ROOT / "reference"))
 
 import structured  # noqa: E402
+import strict_tools  # noqa: E402
 import worker  # noqa: E402
 from launch import ENGINE_ENV_DEFAULTS, Launch, default_spec, env_settings, model_dir, set_engine_env  # noqa: E402,F401
 from stats import HUB, request_meta  # noqa: E402
@@ -832,10 +833,12 @@ class Server:
             images = (spans, srcs, videos)
         return ids, images
 
-    def force(self, choice, thinking):
+    def force(self, choice, thinking, grammar=None):
         """The worker's forced output of a tool choice ((mode, name), chat.tool_choice_of), or None: the start of a
         call, at the start of the answer, or with thinking after the reasoning's end (`</think>`, then a blank line
         as the template renders it)."""
+        if grammar and grammar.get("strict_tools"):
+            return None  # The matcher must consume the entire call, including its opening prefix.
         text = forced_call(*choice)
         if text is None:
             return None
@@ -843,12 +846,38 @@ class Server:
             return (None, self.encode(text))
         return (self.tok.token_id(THINK_END), self.encode("\n\n" + text))
 
-    def constrain(self, fmt, choice, tools, thinking):
+    def constrain(self, fmt, choice, tools, thinking, parallel=True):
         """The worker's grammar of an output format ((what, value), structured.*_format; None: free text), or None. It
         applies after the reasoning; while the model may call tools (tool_choice auto) it may call them instead. A
-        forced tool call has no format."""
+        forced tool call has no response format. Opt-in strict tools constrain the call itself and suppress the
+        forced prefix, so the matcher sees every token."""
         try:
             spec = fmt()
+            if choice[0] != "none" and strict_tools.enabled(tools):
+                tokens = (self.tok.token_id("<tool_call>"), self.tok.token_id("</tool_call>"))
+                try:
+                    definitions = strict_tools.rules(tools, choice)
+                    parallel = parallel and choice[0] != "named"
+                    if spec is not None and choice[0] == "auto":
+                        g = structured.grammar(spec, lead_ws=thinking, calls=tokens,
+                                               call_rules=strict_tools.call_rules(definitions, tokens, parallel))
+                        after = self.tok.token_id(THINK_END) if thinking else None
+                    else:
+                        lazy = choice[0] == "auto"
+                        g = strict_tools.grammar(definitions, tokens, after_start=lazy, parallel=parallel,
+                                                 lead_ws=thinking and not lazy)
+                        after = tokens[0] if lazy else self.tok.token_id(THINK_END) if thinking else None
+                    # Compilation without a tokenizer can succeed while the real vocabulary exceeds matcher
+                    # limits. Preserve the legacy format/forced choice for that final worker-side fallback.
+                    fallback_g = (structured.grammar(spec, lead_ws=thinking, calls=tokens)
+                                  if spec is not None and choice[0] == "auto" else None)
+                    fallback = {"grammar": fallback_g,
+                                "grammar_after": self.tok.token_id(THINK_END) if thinking else None,
+                                "force": self.force(choice, thinking)}
+                    return {"grammar": g, "grammar_after": after, "strict_tools": True,
+                            "strict_tools_fallback": fallback}
+                except (ValueError, RuntimeError, RecursionError, TypeError):
+                    strict_tools.LOG.warning("strict_tools: request uses legacy mode (unsupported grammar or limit)")
             if spec is None or choice[0] in ("required", "named"):
                 return None
             calls = ((self.tok.token_id("<tool_call>"), self.tok.token_id("</tool_call>"))
@@ -1335,10 +1364,11 @@ class Handler(BaseHTTPRequestHandler):
             raise ApiError(400, "max_tokens must be positive")
         stream = bool(body.get("stream"))
         keep = (lambda: self._keepalive_comment()) if stream else None
-        grammar = self.srv.constrain(lambda: structured.chat_format(body), choice, tools, thinking)
+        grammar = self.srv.constrain(lambda: structured.chat_format(body), choice, tools, thinking,
+                                     parallel=body.get("parallel_tool_calls") is not False)
         sampling = dict(sampling_of(body), logprobs=nlp, **token_controls_of(body, self.srv.vocab, min(max_new, left)))
         gen = Generation(self.srv, ids, min(max_new, left), sampling,
-                         stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking),
+                         stops_of(body.get("stop")), images, self.connection, keep, self.srv.force(choice, thinking, grammar),
                          grammar, marked=True)
         parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         rid, created, model = f"chatcmpl-{gen.rid[4:]}", int(time.time()), self._model(body)
@@ -1487,9 +1517,10 @@ class Handler(BaseHTTPRequestHandler):
         single_call = bool(tc.get("disable_parallel_tool_use")) or choice[0] == "named"
         stream = bool(body.get("stream"))
         keep = (lambda: self._sse({"type": "ping"}, "ping")) if stream else None
-        grammar = self.srv.constrain(lambda: structured.anthropic_format(body), choice, tools, thinking)
+        grammar = self.srv.constrain(lambda: structured.anthropic_format(body), choice, tools, thinking,
+                                     parallel=not single_call)
         gen = Generation(self.srv, ids, min(body["max_tokens"], left), sampling_of(body),
-                         stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking),
+                         stops_of(body.get("stop_sequences")), images, self.connection, keep, self.srv.force(choice, thinking, grammar),
                          grammar, marked=True)
         parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         mid, model = f"msg_{gen.rid[4:]}", self._model(body)
@@ -1606,10 +1637,11 @@ class Handler(BaseHTTPRequestHandler):
         choice = tool_choice_of(body.get("tool_choice"), tools)
         parse_tools = bool(tools) and choice[0] != "none"
         stream = bool(body.get("stream"))
-        grammar = self.srv.constrain(lambda: structured.responses_format(body), choice, tools, thinking)
+        grammar = self.srv.constrain(lambda: structured.responses_format(body), choice, tools, thinking,
+                                     parallel=body.get("parallel_tool_calls") is not False)
         nlp = responses_logprobs_of(body)
         gen = Generation(self.srv, ids, max_new, dict(sampling_of(body), logprobs=nlp), (), images, self.connection,
-                         (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking),
+                         (lambda: self._keepalive_comment()) if stream else None, self.srv.force(choice, thinking, grammar),
                          grammar, marked=True)
         parser = OutputParser(thinking, tools if parse_tools else None, marked=True)
         resp = {"id": f"resp_{gen.rid[4:]}", "object": "response", "created_at": int(time.time()), "status": "in_progress",
