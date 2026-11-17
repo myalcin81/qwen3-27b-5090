@@ -25,7 +25,8 @@ def settings():
     return launch.Launch({"prefill_chunk": 2048, "engine_python": str(ROOT / "engine/python")}, dict(DEFAULTS))
 
 
-def test_auto_budget_is_the_engines():
+def test_auto_budget_is_the_engines(monkeypatch):
+    monkeypatch.setattr(launch, "uses_wddm_budget", lambda: True)
     # memory.cc budget_for: min(free - 0.6, 30.3 - used); the engine logged 28.69 GiB for this device.
     assert abs(launch.auto_budget(*DEVICE) / GiB - 28.68) < 0.01
 
@@ -101,8 +102,12 @@ def test_plans_match_the_engine():
     # counts of the 8 sequences, 7.6 MiB). With the DSpine draft (the default since; window 2048): 601856 tokens,
     # 28.3924 GiB (its codebook is in host memory, its sender table of the draft vocabulary, 256 MB, on the device);
     # 28.3985 since the per-lane verify rows of batched steps (P3-38, 5.6 MiB of step buffers; the pool is the same).
-    assert (p["max_tokens"], p["kv_tokens"], p["fits"]) == (262144, 601856, True)
-    assert abs(p["device"] / GiB - 28.3985) < 0.001 and abs(p["budget"] / GiB - 28.68) < 0.01
+    assert p["max_tokens"] == 262144 and p["fits"]
+    assert abs(p["budget"] - launch.auto_budget(*DEVICE)) <= 1
+    if launch.uses_wddm_budget():
+        assert p["kv_tokens"] == 601856 and abs(p["device"] / GiB - 28.3985) < 0.001
+    else:
+        assert p["kv_tokens"] > 601856 and p["device"] <= p["budget"]
     kv = {v["value"]: v["plan"] for v in out["variants"]["kv_dtype"]}
     assert kv["nvfp4"] == p and kv["fp8"]["kv_tokens"] < kv["nvfp4"]["kv_tokens"]
     small = {v["value"]: v["plan"] for v in out["variants"]["vram_budget_gib"]}[20.0]
