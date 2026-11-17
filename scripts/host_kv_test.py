@@ -30,7 +30,8 @@ def main():
                       MAX_SEQS="2" if args.park else "1", MAX_TOKENS_FIT="0")
     print("fixture:", {k: os.environ[k] for k in ("STATE_HOST_CACHE", "KV_HOST_CACHE", "KV_POOL_TOKENS",
                                                 "CHECKPOINT_INTERVAL", "MAX_SEQS", "MAX_TOKENS_FIT")}, flush=True)
-    print("runtime:", {k: v for k, v in os.environ.items() if k.startswith("Q27_")}, flush=True)
+    print("runtime:", {k: os.environ.get(k, "default") for k in
+                       ("Q27_SKINNY_EXACT", "Q27_ATTN_TC", "Q27_SPEC_PATHS", "Q27_PAGES_HIGH")}, flush=True)
     from q27lib import Engine, lib
     from qwen27b.paths import draft_snapshot, engine_target
 
