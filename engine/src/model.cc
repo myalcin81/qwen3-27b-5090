@@ -80,6 +80,8 @@ Model::Model(const Options& opt) : opt_(opt) {
   kv_block_ = int(ceil_div(size_t(2) << 20, kv_page_bytes_));
   if (const char* e = getenv("Q27_KV_BLOCK"); e && atoi(e) > 0) kv_block_ = atoi(e);
   cache_on_ = opt.state_cache_gib > 0;
+  const char* check_refs = getenv("Q27_CHECK_CACHE_REFS");
+  check_cache_refs_ = check_refs && atoi(check_refs) != 0;
   conv_bytes_ = size_t(kGdnLayers) * kConvDim * (kConvK - 1) * sizeof(float);
   ssm_bytes_ = size_t(kGdnLayers) * kVHeads * kKDim * kVDim * sizeof(float);
   const bool spec = !opt.draft_dir.empty();
@@ -614,7 +616,7 @@ bool Model::evict_checkpoint(Eviction reason, bool host_only) {
 void Model::erase_checkpoint(size_t index, Eviction reason) {
   inventory_dirty_ = true;
   auto it = ckpts_.begin() + index;
-  for (int32_t p : it->pages) cache_unref(p);
+  for (int32_t p : it->pages) checkpoint_unref(p);
   slot_used_[it->slot] = false;
   ckpts_.erase(it);
   cstats_.evicted++;
@@ -651,7 +653,7 @@ bool Model::relieve_kv_pressure() {
     // checkpoints may share a host page, so a caller may need more than one eviction before it is free.
     return evict_checkpoint(Eviction::Host, true) || evict_checkpoint(Eviction::Gpu);
   }
-  rebind_checkpoints(ckpts_, moved, [&](int p) { pool_.unref(p); }, [&](int h) { host_kv_.ref(h); });
+  rebind_checkpoints(ckpts_, moved, [&](int p) { pool_.checkpoint_unref(p); }, [&](int h) { host_kv_.ref(h); });
   inventory_dirty_ = true;
   for (const auto& [p, h] : moved) host_kv_.unref(h);  // transfer's temporary references
   cstats_.demoted += int64_t(moved.size());
@@ -706,7 +708,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
     }
   }
   ck.pages.assign(pages.begin(), pages.begin() + ceil_div(pos, kPageTokens));
-  for (int32_t p : ck.pages) pool_.ref(p);
+  for (int32_t p : ck.pages) pool_.checkpoint_ref(p);
   ck.slot = slot;
   ck.last_use = ++use_clock_;
   slot_used_[slot] = true;
@@ -786,7 +788,7 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
       // Do not return a host slot to the free list until all H2D readers are done. Rebind every sharing
       // checkpoint at once: repeated hits can then use GPU pages, with no stale host copy to maintain.
       Q27_CUDA(cudaStreamSynchronize(s_));
-      rebind_checkpoints(ckpts_, restored, [&](int h) { host_kv_.unref(h); }, [&](int p) { pool_.ref(p); });
+      rebind_checkpoints(ckpts_, restored, [&](int h) { host_kv_.unref(h); }, [&](int p) { pool_.checkpoint_ref(p); });
       inventory_dirty_ = true;
     } catch (...) {
       cudaStreamSynchronize(s_);
@@ -842,14 +844,20 @@ void Model::checkpoint() {
 }
 
 void Model::cache_stats(int64_t* out) const {
+  if (check_cache_refs_) {
+    const auto refs = checkpoint_refs(ckpts_, pool_.pages());
+    int only = 0;
+    for (int p = 1; p < pool_.pages(); ++p) {
+      Q27_CHECK(refs[p] == pool_.checkpoint_refs(p), "checkpoint reference accounting mismatch");
+      only += refs[p] > 0 && refs[p] == pool_.refs(p);
+    }
+    Q27_CHECK(only == pool_.checkpoint_only_pages(), "checkpoint-only page accounting mismatch");
+  }
   out[0] = cstats_.lookups, out[1] = cstats_.hits, out[2] = cstats_.prompt_tokens, out[3] = cstats_.cached_tokens;
   out[4] = cstats_.saved, out[5] = cstats_.evicted, out[6] = int64_t(ckpts_.size()), out[7] = pool_.free_pages();
-  // A page only checkpoints hold has as many references as checkpoints listing it (the scheduler counts these
-  // as room for a new request, P7-14).
-  const auto n = checkpoint_refs(ckpts_, pool_.pages());
-  int64_t ckpt_only = 0;
-  for (int p = 1; p < pool_.pages(); p++) ckpt_only += n[p] > 0 && n[p] == pool_.refs(p);
-  out[8] = ckpt_only, out[9] = pool_.pages() - 1, out[10] = park_pages_;
+  // Updated with both checkpoint and active/parked/temporary owners: admission sees current reclaimable
+  // capacity without rebuilding every checkpoint's page references on each query.
+  out[8] = pool_.checkpoint_only_pages(), out[9] = pool_.pages() - 1, out[10] = park_pages_;
   out[11] = int64_t(std::count_if(slot_mem_.begin(), slot_mem_.end(), [](char* m) { return m != nullptr; }));
 }
 
