@@ -364,6 +364,10 @@ Admission still accounts for **device** capacity for the complete resumed contex
 subtracted from the device pages required by a new sequence. The existing `est_cached` estimate remains an
 ordering heuristic, while `prefix_begin` supplies the actual hit count.
 
+`q27:slots_allocated` reports the number of pinned state-cache slots actually allocated, including reusable
+slots without a retained checkpoint. It is a count, not bytes or the planned slot capacity, and is available
+on `/metrics` without enabling diagnostic inventory scans.
+
 `q27:kv_host_pages` counts live host pages; `q27:kv_host_bytes` includes reusable allocated slabs, and
 `q27:kv_host_budget_bytes` is the rounded capacity. Demotion/restoration and allocation-failure counters use the
 `_total` suffix. `q27:prefix_cache_evictions_by_reason_total{reason="state|gpu|host"}` distinguishes pressure on the
