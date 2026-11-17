@@ -320,8 +320,9 @@ convolution, the draft's context ring: 189.9 MiB).
   generation. Positions are rounded down to multiples of 64 ([§8](#8-prefill)).
 - **Where they are kept**: in pinned host memory (`STATE_HOST_CACHE`, 4 GiB = 21 checkpoints). Saving copies the
   state to one staging buffer on the GPU and then to the host on a copy stream; restoring copies from the host
-  (4 to 6 ms). Eviction is LRU, and the KV pool also reclaims pages from the least recently used checkpoints.
-- **Lookup** is a linear scan with `memcmp` over the token sequences; there are at most a few dozen checkpoints.
+  (4 to 6 ms). Under state-slot pressure, covered intermediates go before independent prefix ends; ties use LRU.
+  GPU/host KV pressure retains its separate LRU policy.
+- **Lookup** is a linear scan with `memcmp` over the token sequences; its size is bounded by the state budget.
 - **Exactness**: the state is kept in FP32 and the boundaries follow the GDN chunks, so a request resumed from a
   checkpoint produces exactly the tokens it would produce without the cache (`scripts/prefix_cache_test.py`).
 
@@ -334,6 +335,18 @@ output and user message comes from the cache.
 pool fills. This is separate from `STATE_HOST_CACHE`, which still limits how many GDN/conv/draft checkpoints can
 survive. Increasing only one budget cannot remove pressure on the other. For example, 16 GiB of state is roughly
 86 draft-enabled checkpoints, not 86 conversations: each conversation may save several checkpoints.
+
+When all state slots are occupied, eviction classifies the existing checkpoints plus the pending save as a
+compressed prefix tree. Covered non-boundary intermediates are cheapest, followed by earlier prompt boundaries
+covered by a deeper boundary. The deepest prompt boundary (retry) and generated continuation (next turn) survive
+preferentially, as do known branch points with multiple children. A plain descendant never makes a speculative
+checkpoint redundant. LRU breaks ties and remains the fallback when independent useful prefixes exceed capacity.
+If an optional interval has no cheap victim, its save is skipped; its prefill cut is unchanged, preserving numerical
+paths. Explicit boundary metadata follows sequences through parking. With spare slots, intervals are kept as
+before. This policy applies with or without host KV. State eviction counters include these cheap removals, so
+interpret them alongside actual cache hits, host restores and latency rather than assuming every removal loses a
+session. CPU tests cover a 40-session/86-slot retention fixture; GPU correctness and real workload acceptance are
+separate checks.
 
 Checkpoint page references are positive GPU page IDs or negative host-slot IDs. Only pages owned exclusively by
 checkpoints may move to RAM. Every checkpoint sharing a page is rebound to its single immutable host copy; a GPU

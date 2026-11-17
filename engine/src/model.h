@@ -224,13 +224,14 @@ class Model {
   // Writes physical pages to a device page table (as the kernels read it: page * kKvSlices, P7-13).
   void upload_pages(int32_t* table, const int32_t* pages, size_t n);
   void release_seq();                // returns the running sequence's pages
-  void save_checkpoint(bool ring);   // at pos_ (nothing pending)
+  void save_checkpoint(bool ring, bool boundary = false, bool interval = false); // at pos_ (nothing pending)
   // A checkpoint of tokens ids (pages: their KV pages) whose state is in a parking area (null: the running sequence's).
   void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
-                            bool ring);
+                              bool ring, bool boundary = false, bool interval = false);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
   enum class Eviction { State, Gpu, Host };
   bool evict_checkpoint(Eviction reason, bool host_only = false);
+  void erase_checkpoint(size_t index, Eviction reason);
   bool relieve_kv_pressure();        // demote checkpoint-only pages, or evict when the host tier is full
   void cache_ref(int p) { if (p > 0) pool_.ref(p); else host_kv_.ref(p); }
   void cache_unref(int p) { if (p > 0) pool_.unref(p); else host_kv_.unref(p); }
@@ -338,6 +339,7 @@ class Model {
   cudaEvent_t stage_ev_ = nullptr, stage_in_ev_ = nullptr;  // staging free again / filled
   cudaStream_t cs_ = nullptr;        // device -> host copies of checkpoints
   std::vector<int32_t> plan_;        // checkpoint positions of the running prefill (ascending)
+  std::vector<int32_t> boundaries_;  // explicit positions in plan_ (intervals are not prompt boundaries)
   uint64_t use_clock_ = 0;
   CacheStats cstats_;
   int32_t* pos_dev_ = nullptr;       // == pos_ between calls; read by the attention kernels
@@ -367,7 +369,7 @@ class Model {
     char* dev = nullptr;  // the device area
     bool used = false;
     int pos = 0;
-    std::vector<int32_t> pages, ids, plan;
+    std::vector<int32_t> pages, ids, plan, boundaries;
     std::vector<MmSpan> mm;
     int32_t spec_last = -1;
     bool ring_valid = false;
