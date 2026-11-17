@@ -9,8 +9,11 @@ must not change while it starts engines (a spawned engine copies it).
 """
 
 import json
+import math
 import multiprocessing as mp
 import os
+import pathlib
+import sys
 import threading
 
 from qwen27b.paths import DFLASH2, DRAFTS, DSPINE, PROFILES, TARGET, downloaded_repos, engine_target, snapshot, unreadable_repos
@@ -80,13 +83,32 @@ def env_settings():
 
 
 def margin_gib():
-    return float(os.environ.get("WDDM_MARGIN_GIB", 0.6))
+    value = float(os.environ.get("VRAM_MARGIN_GIB") or os.environ.get("WDDM_MARGIN_GIB") or 0.6)
+    if not math.isfinite(value) or value < 0 or value >= ((1 << 64) - 1) / GiB:
+        raise ValueError("VRAM_MARGIN_GIB / WDDM_MARGIN_GIB must be a finite, nonnegative GiB value")
+    return value
+
+
+def uses_wddm_budget():
+    """Same classification as budget.cc: Windows/WSL, or an unknown kernel, retain the 30.3 GiB cap."""
+    if sys.platform == "linux":
+        for path in ("/proc/sys/kernel/osrelease", "/proc/version"):
+            try:
+                release = pathlib.Path(path).read_text(encoding="utf-8").splitlines()[0].lower()
+                if release:
+                    return "microsoft" in release or "wsl" in release
+            except (OSError, UnicodeError, IndexError):
+                pass
+    return True
 
 
 def auto_budget(free, total):
-    """The engine's budget without VRAM_BUDGET_GIB (memory.cc budget_for), in bytes."""
-    used = (total - free) / GiB
-    return int(max(0.0, min(free / GiB - margin_gib(), 30.3 - used)) * GiB)
+    """The engine's automatic budget (budget.cc), including the platform-specific WDDM ceiling."""
+    free = min(free, total)
+    available = free / GiB - margin_gib()
+    if uses_wddm_budget():
+        available = min(available, 30.3 - (total - free) / GiB)
+    return int(max(0.0, available) * GiB)
 
 
 def model_dir(weights):
@@ -164,7 +186,8 @@ class Launch:
             s["vram_budget_gib"] = round(float(b), 2)
             if check_budget and device is not None and s["vram_budget_gib"] * GiB > auto_budget(*device) + GiB // 100:
                 raise ValueError(f"vram_budget_gib: at most the automatic budget, {auto_budget(*device) / GiB:.2f} GiB "
-                                 f"(free memory minus {margin_gib():g} GiB, at most 30.3 GiB for the process)")
+                                 f"(free memory minus {margin_gib():g} GiB"
+                                 + (", at most 30.3 GiB for the process on Windows/WSL)" if uses_wddm_budget() else ")"))
         return s
 
     def config(self, s):
