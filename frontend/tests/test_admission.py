@@ -9,6 +9,34 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 import worker  # noqa: E402
 
 
+def test_bad_submission_does_not_kill_other_requests():
+    s = object.__new__(worker.Scheduler)
+    s.returns, s.history, s.waiting = collections.deque(), collections.deque(), collections.deque()
+    s.alive, s.by_id, s.m = [], {}, collections.Counter()
+    s.im_start, s.user, s.breaks = 100, 101, frozenset()
+    req = dict(ids=[1, 2], max_new=1, temperature=1.0, top_k=20, top_p=0.95)
+    inbox = collections.deque([("submit", "bad-seed", dict(req, seed={})),
+                               ("submit", "good", req), ("submit", "bad-ids", dict(req, ids=[2**31]))])
+
+    class Pipe:
+        sent = []
+
+        def poll(self, timeout):
+            return bool(inbox)
+
+        def recv(self):
+            return inbox.popleft()
+
+        def send(self, msg):
+            self.sent.append(msg)
+
+    s.conn = Pipe()
+    s.poll(False)
+    assert list(s.by_id) == ["good"]
+    assert [r.rid for r in s.waiting] == ["good"]
+    assert [(m[0], m[1], m[-1]) for m in s.conn.sent] == [("error", "bad-seed", 400), ("error", "bad-ids", 400)]
+
+
 class FakeEngine:
     def __init__(self, free, ckpt_only=0, park=171):
         self.st = {"free_pages": free, "checkpoint_only_pages": ckpt_only, "park_pages": park, "checkpoints": 0,
@@ -41,6 +69,51 @@ def seq(rid, n, max_new=10_000, ids=None, started=False, fed=0, area=None, out=0
                          "temperature": 1.0, "top_k": 20, "top_p": 0.95}, 0.0)
     s.started, s.fed, s.area, s.out = started, fed, area, [0] * out
     return s
+
+
+def test_prefix_bytes_follow_same_length_replacement_and_stay_cached():
+    s = seq(1, 0, ids=[1, 2, 3])
+    old = s.ids_bytes()
+    assert s.ids_bytes() is old
+    s.eng_ids = [4, 5, 6]
+    expected = seq(2, 0, ids=[4, 5, 6]).ids_bytes()
+    assert s.ids_bytes() == expected
+    assert s.ids_bytes() != old
+    assert s.ids_bytes() is s.ids_bytes()
+
+
+def test_prefix_bytes_follow_growth():
+    s = seq(1, 0, ids=[1, 2, 3])
+    s.ids_bytes()
+    s.eng_ids.append(4)
+    assert s.ids_bytes() == seq(2, 0, ids=[1, 2, 3, 4]).ids_bytes()
+
+
+def test_restart_refreshes_prefix_bytes_even_when_token_count_is_unchanged():
+    sch = scheduler(FakeEngine(free=10000))
+    sch.cur = None
+    s = seq(1, 0, ids=[1, 2, 3])
+    s.ids_bytes()
+    s.prompt = [4, 5, 6]
+    sch.restart(s)
+    assert s.ids_bytes() == seq(2, 0, ids=[4, 5, 6]).ids_bytes()
+
+
+def test_reassigned_ids_do_not_share_a_stale_prefix():
+    sch = scheduler(FakeEngine(free=10000))
+    sch.history, sch.by_id = collections.deque(), {}
+    sch.im_start, sch.user, sch.breaks = 100, 101, frozenset()
+    earlier = seq(1, 0, ids=[1] * 512)
+    earlier.ids_bytes()
+    earlier.eng_ids = [2] * 512
+    sch.waiting.append(earlier)
+    req = dict(ids=[1] * 512, max_new=1, temperature=1.0, top_k=20, top_p=0.95)
+    sch.submit("old-prefix", req)
+    assert sch.by_id["old-prefix"].share_with is None
+    assert sch.by_id["old-prefix"].share_len == 0
+    sch.submit("new-prefix", dict(req, ids=[2] * 512))
+    assert sch.by_id["new-prefix"].share_with is earlier
+    assert sch.by_id["new-prefix"].share_len == 448
 
 
 def test_first_request_always_starts():

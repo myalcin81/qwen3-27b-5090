@@ -110,13 +110,22 @@ class Seq:
         self.dead = False
         self.share_with, self.share_len = None, 0  # an earlier request still computing a prefix this one shares
         self.held = False        # kept waiting by the admission (counted once)
-        self._bytes = None
         self.begun = None        # time of the first prefix_begin
         self.computed = 0        # prompt tokens prefilled (not restored from the cache)
         self.prefill_s = self.decode_s = 0.0  # time in its prefill turns / decode turns (a batched turn counts for each)
         self.steps = 0           # decode steps (speculative: verify steps)
         self.drafted = self.draft_accepted = 0  # draft tokens verified, and those accepted (as llama.cpp counts them)
         self.marks = [0, 0, 0]   # end of the first message, starts of the last message and the generation prompt
+
+    @property
+    def eng_ids(self):
+        return self._eng_ids
+
+    @eng_ids.setter
+    def eng_ids(self, ids):
+        # Replace the list when token values change, even if its length stays the same.
+        self._eng_ids = ids
+        self._bytes = None
 
     @property
     def biased(self):
@@ -195,7 +204,10 @@ class Scheduler:
         while self.conn.poll(0):
             msg = self.conn.recv()
             if msg[0] == "submit":
-                self.submit(msg[1], msg[2])
+                try:
+                    self.submit(msg[1], msg[2])
+                except (TypeError, ValueError, OverflowError) as e:
+                    self.send("error", msg[1], f"invalid request: {e}", 400)
             elif msg[0] == "cancel":
                 self.cancel(msg[1])
             elif msg[0] == "config":
@@ -218,9 +230,9 @@ class Scheduler:
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run
         # past it (with a checkpoint planned there) instead of computing it again.
-        p = array.array("i", s.prompt).tobytes()
+        p = s.ids_bytes()
         for o in list(self.alive) + list(self.waiting):
-            n = lcp_bytes(p, array.array("i", o.eng_ids).tobytes())
+            n = lcp_bytes(p, o.ids_bytes())
             n = min(n, len(s.prompt) - 1) // 64 * 64
             if n > max(s.reusable, s.share_len) + 256 and not (o.started and o.fed >= n):
                 s.share_with, s.share_len = o, n
@@ -867,7 +879,7 @@ class Scheduler:
         elif v.area is not None:
             self.engine.seq_suspend(v.area)
             v.area = None
-        v.eng_ids = v.prompt + v.out  # (ids_bytes follows the new length)
+        v.eng_ids = v.prompt + v.out  # the assignment invalidates ids_bytes, including an unchanged length
         v.started, v.fed, v.phase = False, 0, PREFILL
 
     def finish(self, s, reason, save=True, notify=True):
