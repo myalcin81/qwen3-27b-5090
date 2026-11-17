@@ -401,6 +401,11 @@ in addition to state, embeddings and other process RAM; allocation is bounded an
 configured memory is available. NVFP4 occupies 1.125 MiB per 64-token page across all attention layers; FP8 uses
 2 MiB and BF16 4 MiB.
 
+Budget for the unique retained prefixes plus generated continuations and temporary restore copies. A cyclic scan
+just larger than the GPU/host capacity can have very few LRU hits even though most prefixes fit at each snapshot.
+The [native Linux replay evaluation](results/20261118-host-kv.md) records this distinction and the tested budgets;
+it does not change the default host budget or promise the same latency for every working set.
+
 ## 10. Scheduler and concurrency
 
 Up to `MAX_SEQS` (8) requests are in the engine at once. One of them owns the "running" state buffers; the others
