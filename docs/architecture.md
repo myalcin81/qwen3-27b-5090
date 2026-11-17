@@ -127,7 +127,9 @@ counts toward Windows' "shared GPU memory" without slowing anything down.
 At startup the engine computes a plan, allocates each pool once and never calls `cudaMalloc` while serving.
 
 - **Budget**: the free VRAM at startup (with other programs counted: the server passes what NVML sees, since
-  `cudaMemGetInfo` does not count them, on WSL2 or on Windows) minus `WDDM_MARGIN_GIB` (0.6 GiB), at most 30.3 GiB. If a configuration
+  `cudaMemGetInfo` does not count them, on WSL2 or on Windows) minus `VRAM_MARGIN_GIB` (legacy alias
+  `WDDM_MARGIN_GIB`, default 0.6 GiB). Windows/WSL also enforce 30.3 GiB minus already-used VRAM; native Linux
+  uses the free-memory bound without that WDDM ceiling. The frontend and native planner use the same policy. If a configuration
   does not fit, the engine stops with the breakdown in the log; the server's `MAX_TOKENS_FIT=1` instead lowers
   `MAX_TOKENS` to what fits.
 - **Pools** (separate, no padding to a common page size):

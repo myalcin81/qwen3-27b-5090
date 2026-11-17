@@ -169,25 +169,6 @@ Budget make_budget() {
   return budget_for(free, total);
 }
 
-Budget budget_for(size_t free, size_t total) {
-  Budget b;
-  b.free_at_start = free, b.total = total;
-  double margin = 0.6, cap = 30.3;
-  if (const char* m = getenv("WDDM_MARGIN_GIB")) margin = atof(m);
-  // cudaMemGetInfo's free reaches 0 well before WDDM starts to evict (measured on WSL2), so take the
-  // smaller of "free minus margin" and the measured safe process total minus what is already used.
-  double used = double(b.total - b.free_at_start) / kGiB;
-  double by_free = double(b.free_at_start) / kGiB - margin;
-  b.budget = size_t(std::max(0.0, std::min(by_free, cap - used)) * kGiB);
-  // VRAM_BUDGET_GIB only lowers it: above this, WDDM would move memory to the host without an error.
-  if (const char* v = getenv("VRAM_BUDGET_GIB")) {
-    const size_t asked = size_t(atof(v) * kGiB);
-    if (asked > b.budget) b.asked = asked;
-    b.budget = std::min(asked, b.budget);
-  }
-  return b;
-}
-
 void check_and_log(const Budget& b, const std::vector<Pool*>& pools) {
   size_t dev = 0, host = 0;
   log("memory budget: free at start %.2f GiB of %.2f GiB, budget %.2f GiB", b.free_at_start / kGiB, b.total / kGiB,

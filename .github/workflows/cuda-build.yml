@@ -1,0 +1,18 @@
+name: CUDA build
+
+on:
+  push:
+    paths: ["engine/**", "Dockerfile", ".github/workflows/cuda-build.yml"]
+  pull_request:
+    paths: ["engine/**", "Dockerfile", ".github/workflows/cuda-build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - run: docker build --target build --build-arg BUILD_JOBS=3 -t q27-build-check .

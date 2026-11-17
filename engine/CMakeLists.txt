@@ -33,6 +33,7 @@ add_library(q27 SHARED
   src/safetensors.cc
   src/prefetch.cc
   src/memory.cc
+  src/budget.cc
   src/weights.cc
   src/kernels.cu
   src/gemm_mma.cu
