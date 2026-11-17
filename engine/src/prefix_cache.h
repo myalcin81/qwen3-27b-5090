@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <iterator>
+#include <map>
 #include <set>
 #include <vector>
 
@@ -78,7 +79,7 @@ class PagePool {
 
 struct Checkpoint {
   std::vector<int32_t> ids;    // the tokens [0, pos)
-  std::vector<int32_t> pages;  // physical KV pages of [0, pos) (one reference each)
+  std::vector<int32_t> pages;  // KV pages of [0, pos): >0 GPU, <0 HostKvPages (one reference each)
   int slot = -1;               // host state slot
   bool ring = false;           // the draft's context ring is valid for [pos - 2048, pos)
   uint64_t last_use = 0;
@@ -87,6 +88,47 @@ struct Checkpoint {
 
 struct CacheStats {
   int64_t lookups = 0, hits = 0, prompt_tokens = 0, cached_tokens = 0, saved = 0, evicted = 0;
+  int64_t demoted = 0, restored = 0, evicted_state = 0, evicted_gpu = 0, evicted_host = 0;
 };
+
+// Count only checkpoint references, so active/parked sequences (and in-flight restores) prevent demotion.
+inline std::vector<int32_t> checkpoint_refs(const std::vector<Checkpoint>& checkpoints, int pages) {
+  std::vector<int32_t> refs(pages, 0);
+  for (const auto& c : checkpoints)
+    for (int p : c.pages) if (p > 0) refs[p]++;
+  return refs;
+}
+
+inline std::vector<int32_t> demotion_batch(const std::vector<Checkpoint>& checkpoints, const PagePool& pool,
+                                          size_t limit = 256) {
+  const auto refs = checkpoint_refs(checkpoints, pool.pages());
+  const Checkpoint* oldest = nullptr;
+  for (const auto& c : checkpoints) {
+    if (oldest && c.last_use >= oldest->last_use) continue;
+    for (int p : c.pages)
+      if (p > 0 && refs[p] == pool.refs(p)) { oldest = &c; break; }
+  }
+  std::vector<int32_t> pages;
+  if (oldest)
+    for (int p : oldest->pages) {
+      if (p > 0 && refs[p] == pool.refs(p)) pages.push_back(p);
+      if (pages.size() == limit) break;
+    }
+  return pages;
+}
+
+// Transfer all checkpoint references together, after the copy fence. The caller retains a temporary
+// reference until this finishes, so the destination cannot be recycled midway through a shared remap.
+template <class Release, class Retain>
+void rebind_checkpoints(std::vector<Checkpoint>& checkpoints, const std::map<int, int>& moved,
+                        Release release, Retain retain) {
+  for (auto& c : checkpoints)
+    for (int32_t& p : c.pages)
+      if (const auto it = moved.find(p); it != moved.end()) {
+        release(p);
+        p = it->second;
+        retain(p);
+      }
+}
 
 }  // namespace q27

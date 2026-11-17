@@ -1,0 +1,18 @@
+name: Host KV build
+
+on:
+  push:
+    branches: ["feat/host-kv-prefix-cache"]
+    paths: ["engine/**", "Dockerfile", ".github/workflows/host-kv-build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      # Compile in the same pinned CUDA image as releases. No GPU, registry push or deployment.
+      - run: docker build --target build --build-arg BUILD_JOBS=3 -t q27-host-kv-build .

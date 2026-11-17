@@ -11,6 +11,7 @@
 #include "kernels.h"
 #include "memory.h"
 #include "prefix_cache.h"
+#include "host_kv.h"
 #include "safetensors.h"
 #include "vision.h"
 #include "weights.h"
@@ -28,6 +29,7 @@ struct Options {
   // pool (0: what the VRAM budget leaves; without the cache, max_tokens) and the interval of the
   // checkpoints inside long prompts.
   double state_cache_gib = 0;
+  double kv_host_cache_gib = 0;  // bounded pinned host KV tier; 0 keeps the GPU-only cache
   int kv_pool_tokens = 0;
   int checkpoint_interval = 8192;
   // Vision tower (P4-12): 0 off, 1 BF16 weights on the device, 2 BF16 weights in pinned host memory,
@@ -141,6 +143,7 @@ class Model {
   // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area, state
   // slots allocated.
   void cache_stats(int64_t* out) const;
+  void kv_host_stats(int64_t* out) const;  // out[9], separate from the stable cache_stats ABI
   // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
@@ -226,7 +229,11 @@ class Model {
   void save_checkpoint_from(const char* area, const std::vector<int32_t>& ids, const std::vector<int32_t>& pages,
                             bool ring);
   int prompt_chunks(const int32_t* ids, int n, int budget, bool keep_tail, int* last);
-  bool evict_checkpoint();           // the least recently used one; false when there is none
+  enum class Eviction { State, Gpu, Host };
+  bool evict_checkpoint(Eviction reason, bool host_only = false);
+  bool relieve_kv_pressure();        // demote checkpoint-only pages, or evict when the host tier is full
+  void cache_ref(int p) { if (p > 0) pool_.ref(p); else host_kv_.ref(p); }
+  void cache_unref(int p) { if (p > 0) pool_.unref(p); else host_kv_.unref(p); }
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
   // Captures body; with update, updates that graph in place when only arguments / grids differ (else replaces it).
@@ -323,6 +330,7 @@ class Model {
   // Prefix cache.
   bool cache_on_ = false;
   std::vector<Checkpoint> ckpts_;
+  HostKvPages host_kv_;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring
   std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;

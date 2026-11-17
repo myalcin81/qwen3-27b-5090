@@ -44,6 +44,7 @@ SIGNATURES = {
     "q27_prefix_begin": ([P, P, I, P, I, I, P], I),
     "q27_checkpoint": ([P], I),
     "q27_cache_stats": ([P, P], I),
+    "q27_kv_host_stats": ([P, P], I),
     "q27_cache_grow": ([P, I, P], I),
     "q27_memory_report": ([P, ctypes.c_char_p, I], I),
     "q27_device_memory": ([P, P], I),
@@ -440,7 +441,14 @@ class Engine:
         self._check(lib().q27_cache_stats(self.h, out), "q27_cache_stats")
         keys = ("lookups", "hits", "prompt_tokens", "cached_tokens", "saved", "evicted", "checkpoints", "free_pages",
                 "checkpoint_only_pages", "pool_pages", "park_pages", "slots_allocated")
-        return dict(zip(keys, out))
+        result = dict(zip(keys, out))
+        host_keys = ("kv_host_pages", "kv_host_bytes", "kv_host_budget_bytes", "kv_demoted_pages",
+                     "kv_restored_pages", "evicted_state", "evicted_gpu", "evicted_host", "kv_host_alloc_failures")
+        host_out = (ctypes.c_int64 * len(host_keys))()
+        if fn := getattr(lib(), "q27_kv_host_stats", None):
+            self._check(fn(self.h, host_out), "q27_kv_host_stats")
+        result.update(zip(host_keys, host_out))
+        return result
 
     def memory_report(self):
         """The memory pools: {"pools": [{"name", "host", "bytes", "items": [(what, bytes)]}], "slots": state cache

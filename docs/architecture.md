@@ -326,6 +326,41 @@ convolution, the draft's context ring: 189.9 MiB).
 An agent's turn after a 20K-token conversation reaches its first token in about 0.2 s: everything but the new tool
 output and user message comes from the cache.
 
+### Optional host KV tier
+
+`KV_HOST_CACHE` defaults to zero. A positive budget retains attention KV pages in pinned host RAM when the GPU
+pool fills. This is separate from `STATE_HOST_CACHE`, which still limits how many GDN/conv/draft checkpoints can
+survive. Increasing only one budget cannot remove pressure on the other. For example, 16 GiB of state is roughly
+86 draft-enabled checkpoints, not 86 conversations: each conversation may save several checkpoints.
+
+Checkpoint page references are positive GPU page IDs or negative host-slot IDs. Only pages owned exclusively by
+checkpoints may move to RAM. Every checkpoint sharing a page is rebound to its single immutable host copy; a GPU
+page ID can then be recycled safely. Up to 256 pages are copied per pressure-relief batch on the engine stream,
+which is fenced before any source page can be reused. This first implementation deliberately fences transfers;
+overlap and transfer latency must be evaluated on the target GPU before changing that ordering.
+
+On a hit, the engine first restores the matching state and draft context, then retains all source pages while it
+allocates device pages. Full host pages are restored and rebound to all surviving sharing checkpoints. A partial
+last page always gets a private device copy; the checkpoint keeps its immutable source. H2D completes before host
+slots return to the free list. A failed restore releases its temporary references and device pages before the
+scheduler retries. Parking/video pool compaction remaps positive page references only.
+
+Admission still accounts for **device** capacity for the complete resumed context: host cached tokens cannot be
+subtracted from the device pages required by a new sequence. The existing `est_cached` estimate remains an
+ordering heuristic, while `prefix_begin` supplies the actual hit count.
+
+`q27:kv_host_pages` counts live host pages; `q27:kv_host_bytes` includes reusable allocated slabs, and
+`q27:kv_host_budget_bytes` is the rounded capacity. Demotion/restoration and allocation-failure counters use the
+`_total` suffix. `q27:prefix_cache_evictions_by_reason_total{reason="state|gpu|host"}` distinguishes pressure on the
+three resources (each emitted series has a single reason). The original twelve-value `q27_cache_stats` ABI is
+unchanged; host counters have a separate optional entry point, so Python can still load older engine builds.
+
+Validation on a deployment requires both forced-eviction byte/token parity and a workload larger than the GPU
+pool. CPU ownership tests do not establish GPU correctness or a TTFT/throughput improvement. The host budget is
+in addition to state, embeddings and other process RAM; allocation is bounded and lazy, not a promise that all
+configured memory is available. NVFP4 occupies 1.125 MiB per 64-token page across all attention layers; FP8 uses
+2 MiB and BF16 4 MiB.
+
 ## 10. Scheduler and concurrency
 
 Up to `MAX_SEQS` (8) requests are in the engine at once. One of them owns the "running" state buffers; the others

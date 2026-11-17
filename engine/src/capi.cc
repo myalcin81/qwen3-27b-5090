@@ -127,6 +127,11 @@ Options engine_options(const char* model_dir, int max_tokens, int prefill_chunk,
   // Prefix cache (docs/configuration.md): STATE_HOST_CACHE (GiB of pinned checkpoint slots; 0 / unset: off),
   // KV_POOL_TOKENS (0: what the VRAM budget leaves), CHECKPOINT_INTERVAL (tokens).
   if (const char* e = getenv("STATE_HOST_CACHE")) o.state_cache_gib = atof(e);
+  if (const char* e = getenv("KV_HOST_CACHE")) {
+    char* end = nullptr;
+    o.kv_host_cache_gib = std::strtod(e, &end);
+    Q27_CHECK(end != e && *end == '\0', "KV_HOST_CACHE must be a GiB number");
+  }
   if (const char* e = getenv("KV_POOL_TOKENS")) o.kv_pool_tokens = atoi(e);
   if (const char* e = getenv("CHECKPOINT_INTERVAL")) o.checkpoint_interval = atoi(e);
   // Vision tower (P4-12): VISION (off | bf16 | host | fp8), IMAGE_MAX_PIXELS, IMAGE_TOKENS (image tokens
@@ -358,6 +363,12 @@ int q27_checkpoint(void* m) {
 // only checkpoints hold, pool pages, KV pages of a parking area, state slots allocated.
 int q27_cache_stats(void* m, int64_t* out) {
   return guard([&] { static_cast<Model*>(m)->cache_stats(out); });
+}
+
+// out[9]: used host pages, allocated/budget bytes, demoted/restored pages, state/GPU/host evictions,
+// pinned allocation failures. Kept separate so callers using q27_cache_stats(out[12]) remain safe.
+int q27_kv_host_stats(void* m, int64_t* out) {
+  return guard([&] { static_cast<Model*>(m)->kv_host_stats(out); });
 }
 
 // Allocates up to n more pinned state slots of the prefix cache (*added: how many; 0 once all are).

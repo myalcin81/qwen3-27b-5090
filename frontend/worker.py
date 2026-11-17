@@ -912,6 +912,12 @@ class Scheduler:
                     'q27:admission_blocked{reason="speed"}': int(self.blocked == "speed"),
                     "q27:kv_free_pages": st["free_pages"], "q27:kv_checkpoint_only_pages": st["checkpoint_only_pages"],
                     "q27:prefix_cache_checkpoints": st["checkpoints"], "q27:prefix_cache_evictions_total": st["evicted"]})
+        for key in ("kv_host_pages", "kv_host_bytes", "kv_host_budget_bytes"):
+            out[f"q27:{key}"] = st.get(key, 0)
+        for key in ("kv_demoted_pages", "kv_restored_pages", "kv_host_alloc_failures"):
+            out[f"q27:{key}_total"] = st.get(key, 0)
+        for reason in ("state", "gpu", "host"):
+            out[f'q27:prefix_cache_evictions_by_reason_total{{reason="{reason}"}}'] = st.get(f"evicted_{reason}", 0)
         return out
 
 

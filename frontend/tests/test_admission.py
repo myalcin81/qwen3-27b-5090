@@ -62,6 +62,25 @@ def test_kv_room_counts_prompts_reserve_and_parking_area():
     assert sch.kv_room(new)
 
 
+def test_host_cached_tokens_still_require_gpu_room():
+    sch = scheduler(FakeEngine(free=1))
+    sch.engine.st.update(kv_host_pages=100_000, kv_host_bytes=40 << 30)
+    new = seq(2, 6400)
+    new.est_cached = 6399
+    assert not sch.kv_room(new)  # host pages are restore sources, not device capacity for an active request
+
+
+def test_host_cache_metrics_report_allocations_and_eviction_reasons():
+    sch = scheduler(FakeEngine(free=1))
+    sch.engine.st.update(kv_host_pages=7, kv_host_bytes=128, kv_host_budget_bytes=256,
+                         kv_demoted_pages=13, kv_restored_pages=6, evicted_state=3, evicted_host=2)
+    out = sch.metrics()
+    assert out["q27:kv_host_pages"] == 7 and out["q27:kv_host_bytes"] == 128
+    assert out["q27:kv_demoted_pages_total"] == 13 and out["q27:kv_restored_pages_total"] == 6
+    assert out['q27:prefix_cache_evictions_by_reason_total{reason="state"}'] == 3
+    assert out['q27:prefix_cache_evictions_by_reason_total{reason="host"}'] == 2
+
+
 def test_parked_request_already_holds_its_area():
     run = seq(1, 64, started=True, fed=64, area=0)
     cur = seq(2, 64, started=True, fed=64)
