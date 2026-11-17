@@ -65,6 +65,7 @@ services:
       STATS_SAMPLE_S: ${STATS_SAMPLE_S:-1}         # seconds between the GPU samples of /ui (0: none)
       API_DUMP_DIR: ${API_DUMP_DIR:-}              # debugging: write every POST body to this directory in the container
       API_ALLOWED_HOSTS: ${API_ALLOWED_HOSTS:-}    # trusted DNS names in Host / Origin (IP literals and localhost always work)
+      STRICT_TOOLS: ${STRICT_TOOLS:-0}            # 1: constrain tool names/arguments; unsupported schemas log a fallback
       MEDIA_PRIVATE_HOSTS: ${MEDIA_PRIVATE_HOSTS:-}  # exact hosts allowed to serve media from private addresses
       MAX_REQUEST_BYTES: ${MAX_REQUEST_BYTES:-402653184}  # 384 MiB, including base64 / JSON overhead
       HTTP_BODY_BUDGET: ${HTTP_BODY_BUDGET:-536870912}     # 512 MiB across unfinished POST bodies

@@ -226,6 +226,8 @@ class Scheduler:
                 return
             s.gm = s.matcher if s.grammar_after is None else None
             self.m["q27:structured_requests_total"] += 1
+            if req.get("strict_tools"):
+                self.m["q27:strict_tool_requests_total"] += 1
         s.reusable = self.reusable(s.prompt)
         # Requests that arrive together (an agent and its sub-agents) often share a long prefix (the system
         # prompt and tools) that no checkpoint holds yet: the later one waits until the earlier one has run

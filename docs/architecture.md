@@ -452,6 +452,14 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   lanes' rows are masked. When the reasoning ends, the step's tokens after `</think>` were sampled without the masks:
   they stay if the grammar allows them (the engine masks from the next step on), else the sequence restarts from the
   prefix cache before the first one it does not allow. Logprobs are those of the masked logits.
+- **Opt-in strict tools** (`STRICT_TOOLS=1` or per-tool `strict: true`, `frontend/strict_tools.py`): bounded,
+  cached grammars whitelist names and emit each strict tool's declared parameters in schema order. Raw strings
+  use delimited text; non-string values use JSON subgrammars. Auto without an output format activates the matcher
+  after `<tool_call>`; required/named modes activate at the answer start (after `</think>` when enabled), without
+  inserting an unconsumed forced prefix. Unsupported schemas log a per-tool legacy-argument fallback; oversized
+  requests log a full fallback. `q27:strict_tool_requests_total` counts these requests (including per-tool argument
+  fallbacks); the standard structured-output counters also include them. The parser
+  skips complete JSON object/array values before looking for XML closing tags, so quoted delimiters stay data.
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
   turn's prompt (and the prefix cache) still has it.
 - The server marks message boundaries for the prefix cache and reports, per request, how many tokens came from it.
