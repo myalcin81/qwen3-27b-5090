@@ -33,6 +33,7 @@ class HostKvPages {
   size_t bytes() const { return size_t(allocated()) * page_bytes_; }
   size_t budget() const { return size_t(capacity_) * page_bytes_; }
   int failures() const { return failures_; }
+  int available() const { return (failures_ ? allocated() : capacity_) - used(); }
 
   // Negative references cannot alias a recycled GPU page number. Slot zero is encoded as -1.
   static int encode(int slot) { return -slot - 1; }

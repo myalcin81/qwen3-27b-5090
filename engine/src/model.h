@@ -12,6 +12,7 @@
 #include "memory.h"
 #include "prefix_cache.h"
 #include "host_kv.h"
+#include "kv_demotion.h"
 #include "safetensors.h"
 #include "vision.h"
 #include "weights.h"
@@ -142,9 +143,9 @@ class Model {
   // out[12]: lookups, hits, prompt tokens, cached tokens, checkpoints saved, evicted, live checkpoints, free
   // pages, pages only checkpoints hold (free after evicting them), pool pages, KV pages of a parking area, state
   // slots allocated.
-  void cache_stats(int64_t* out) const;
+  void cache_stats(int64_t* out);
   void kv_host_stats(int64_t* out) const;  // out[9], separate from the stable cache_stats ABI
-  void cache_inventory_stats(int64_t* out) const;  // optional out[10], union and physical ownership
+  void cache_inventory_stats(int64_t* out);  // optional out[10], union and physical ownership
   // Allocates up to n more pinned state slots of the prefix cache (they are not allocated at startup); returns how
   // many it allocated (0: all are). A checkpoint that finds no free slot allocates one itself.
   int grow_state_cache(int n);
@@ -234,6 +235,8 @@ class Model {
   bool evict_checkpoint(Eviction reason, bool host_only = false);
   void erase_checkpoint(size_t index, Eviction reason);
   bool relieve_kv_pressure();        // demote checkpoint-only pages, or evict when the host tier is full
+  bool start_kv_demotion();          // one bounded batch on the independent KV copy stream
+  bool finish_kv_demotion(bool wait);  // publish only after its event; wait at hard pressure/remap/reset
   void cache_ref(int p) { if (p > 0) pool_.ref(p); else host_kv_.ref(p); }
   void cache_unref(int p) { if (p > 0) pool_.unref(p); else host_kv_.unref(p); }
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
@@ -333,6 +336,9 @@ class Model {
   bool cache_on_ = false;
   std::vector<Checkpoint> ckpts_;
   HostKvPages host_kv_;
+  KvDemotion pending_kv_;
+  cudaStream_t ks_ = nullptr;        // optional independent GPU -> host KV stream
+  cudaEvent_t kv_ready_ev_ = nullptr, kv_done_ev_ = nullptr;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring
   std::vector<char*> slot_mem_;      // pinned [ckpt_bytes_] per slot, allocated as needed (grow_state_cache)
   std::vector<bool> slot_used_;

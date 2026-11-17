@@ -2,6 +2,7 @@
 
 Run only in a coordinated, idle GPU window with already installed weights. No downloads or service changes.
 The small GPU pool forces demotion; --park also exercises parking-area relocation while a sequence is held.
+Use --async-demotion to exercise the independent copy stream, including reset, restore and close fences.
 This is a correctness test, not the representative TTFT/decode acceptance benchmark.
 """
 
@@ -41,14 +42,18 @@ def main():
     ap.add_argument("--draft", choices=["dspine", "dflash2"], default="dspine")
     ap.add_argument("--kv-dtype", choices=["nvfp4", "fp8", "bf16"], default="nvfp4")
     ap.add_argument("--park", action="store_true", help="hold a parked sequence through pressure and restore")
+    ap.add_argument("--async-demotion", action="store_true", help="enable event-fenced early GPU-to-host copies")
     args = ap.parse_args()
+    if args.async_demotion:
+        os.environ["KV_ASYNC_DEMOTION"] = "1"
     # Explicit fixture settings, printed below. Runtime math policies are inherited without modification.
     os.environ.update(STATE_HOST_CACHE="4", KV_HOST_CACHE="1", KV_POOL_TOKENS="4096", CHECKPOINT_INTERVAL="0",
                       MAX_SEQS="2" if args.park else "1", MAX_TOKENS_FIT="0")
     print("fixture:", {k: os.environ[k] for k in ("STATE_HOST_CACHE", "KV_HOST_CACHE", "KV_POOL_TOKENS",
                                                 "CHECKPOINT_INTERVAL", "MAX_SEQS", "MAX_TOKENS_FIT")}, flush=True)
     print("runtime:", {k: os.environ.get(k, "default") for k in
-                       ("Q27_SKINNY_EXACT", "Q27_ATTN_TC", "Q27_SPEC_PATHS", "Q27_PAGES_HIGH")}, flush=True)
+                       ("Q27_SKINNY_EXACT", "Q27_ATTN_TC", "Q27_SPEC_PATHS", "Q27_PAGES_HIGH",
+                        "KV_ASYNC_DEMOTION")}, flush=True)
     from q27lib import Engine
     from qwen27b.paths import draft_snapshot, engine_target
 

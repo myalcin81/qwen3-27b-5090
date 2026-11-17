@@ -265,6 +265,13 @@ Model::Model(const Options& opt) : opt_(opt) {
     Q27_CUDA(cudaEventCreateWithFlags(&stage_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventCreateWithFlags(&stage_in_ev_, cudaEventDisableTiming));
     Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
+    const char* async_kv = getenv("KV_ASYNC_DEMOTION");
+    if (host_kv_.capacity() && async_kv && atoi(async_kv) != 0) {
+      Q27_CUDA(cudaStreamCreateWithFlags(&ks_, cudaStreamNonBlocking));
+      Q27_CUDA(cudaEventCreateWithFlags(&kv_ready_ev_, cudaEventDisableTiming));
+      Q27_CUDA(cudaEventCreateWithFlags(&kv_done_ev_, cudaEventDisableTiming));
+      log("host KV: asynchronous demotion enabled (256-page batch, 512-page free watermark)");
+    }
     log("prefix cache: %d state slots of %.1f MiB (%.2f GiB pinned, allocated as needed), checkpoint interval %d", slots,
         ckpt_bytes_ / 1048576.0, slots * double(ckpt_bytes_) / (1 << 30), opt.checkpoint_interval);
   }
@@ -438,6 +445,9 @@ void Model::configure() {
 
 Model::~Model() {
   if (s_) cudaStreamSynchronize(s_);  // (a speculative step may be in flight)
+  if (ks_) cudaStreamSynchronize(ks_), cudaStreamDestroy(ks_);  // before GPU/pinned pool destruction
+  for (auto e : {kv_ready_ev_, kv_done_ev_})
+    if (e) cudaEventDestroy(e);
   for (auto e : spec_ev_)
     if (e) cudaEventDestroy(e);
   for (auto* v : {&dgraphs_, &sgraphs_})
@@ -533,6 +543,7 @@ void Model::set_sbuf(int b) {
 }
 
 void Model::reset() {
+  finish_kv_demotion(true);
   batch_exit();
   Q27_CUDA(cudaStreamSynchronize(s_));  // (drops a speculative step in flight)
   spec_inflight_ = false;
@@ -580,9 +591,13 @@ void Model::upload_pages(int32_t* table, const int32_t* pages, size_t n) {
 void Model::ensure_pages(int tokens) { ensure_pages_of(seq_pages_, page_table_, tokens); }
 
 void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tokens) {
+  finish_kv_demotion(false);
   const int need = std::min(max_pages_, int(ceil_div(tokens, kPageTokens)));
   const int have = int(pages.size());
-  if (need <= have) return;
+  if (need <= have) {
+    if (pool_.free_pages() <= 512) start_kv_demotion();
+    return;
+  }
   // A few pages ahead, so decode does not stop for a page table update every 64 tokens.
   const int want = std::min(max_pages_, need + 8);
   while (int(pages.size()) < want) {
@@ -598,6 +613,9 @@ void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tok
     pages.push_back(p);
   }
   upload_pages(table + have, pages.data() + have, pages.size() - have);
+  // Immutable checkpoint pages may copy while the following prefill/decode uses its own pages.
+  // No early eviction: when host storage is full, ordinary pressure relief retains the existing policy.
+  if (pool_.free_pages() <= 512) start_kv_demotion();
 }
 
 bool Model::evict_checkpoint(Eviction reason, bool host_only) {
@@ -625,6 +643,12 @@ void Model::erase_checkpoint(size_t index, Eviction reason) {
 
 bool Model::relieve_kv_pressure() {
   if (!host_kv_.capacity()) return evict_checkpoint(Eviction::Gpu);
+  if (ks_) {
+    if (finish_kv_demotion(true)) return true;
+    if (start_kv_demotion()) { finish_kv_demotion(true); return true; }
+    if (demotion_batch(ckpts_, pool_, 1).empty()) return false;
+    return evict_checkpoint(Eviction::Host, true) || evict_checkpoint(Eviction::Gpu);
+  }
   const auto candidates = demotion_batch(ckpts_, pool_);
   // No checkpoint-only GPU page: removing a checkpoint cannot free a GPU page. The scheduler must
   // suspend an active sequence; don't throw away useful host checkpoints in an unsuccessful search.
@@ -655,6 +679,48 @@ bool Model::relieve_kv_pressure() {
   inventory_dirty_ = true;
   for (const auto& [p, h] : moved) host_kv_.unref(h);  // transfer's temporary references
   cstats_.demoted += int64_t(moved.size());
+  return true;
+}
+
+bool Model::start_kv_demotion() {
+  if (!ks_ || !pending_kv_.empty() || host_kv_.available() <= 0) return false;
+  const auto candidates = demotion_batch(ckpts_, pool_, std::min(256, host_kv_.available()));
+  if (candidates.empty()) return false;
+  try {
+    // A selected checkpoint may still have writes queued on s_. Source ownership alone is not a fence.
+    Q27_CUDA(cudaEventRecord(kv_ready_ev_, s_));
+    Q27_CUDA(cudaStreamWaitEvent(ks_, kv_ready_ev_));
+    for (int p : candidates) {
+      const int h = host_kv_.alloc();
+      if (!h) break;
+      try { pending_kv_.hold(p, h, pool_); }
+      catch (...) { host_kv_.unref(h); throw; }
+      Q27_CUDA(cudaMemcpy2DAsync(host_kv_.data(h), kv_page_bytes_, kv_page(p, 0),
+                                 size_t(kv_block_) * kv_page_bytes_, kv_page_bytes_, kKvSlices,
+                                 cudaMemcpyDeviceToHost, ks_));
+    }
+    if (!pending_kv_.empty()) Q27_CUDA(cudaEventRecord(kv_done_ev_, ks_));
+  } catch (...) {
+    cudaStreamSynchronize(ks_);
+    pending_kv_.release_after_fence(pool_, host_kv_);
+    throw;
+  }
+  return !pending_kv_.empty();
+}
+
+bool Model::finish_kv_demotion(bool wait) {
+  if (pending_kv_.empty()) return false;
+  if (wait) Q27_CUDA(cudaEventSynchronize(kv_done_ev_));
+  else {
+    const auto status = cudaEventQuery(kv_done_ev_);
+    if (status == cudaErrorNotReady) return false;
+    Q27_CUDA(status);
+  }
+  const auto copied = pending_kv_.size();
+  pending_kv_.publish_after_fence(ckpts_, [&](int p) { pool_.unref(p); }, host_kv_);
+  pending_kv_.release_after_fence(pool_, host_kv_);
+  inventory_dirty_ = true;
+  cstats_.demoted += int64_t(copied);
   return true;
 }
 
@@ -841,7 +907,8 @@ void Model::checkpoint() {
   save_checkpoint(ring_valid_);
 }
 
-void Model::cache_stats(int64_t* out) const {
+void Model::cache_stats(int64_t* out) {
+  finish_kv_demotion(false);
   out[0] = cstats_.lookups, out[1] = cstats_.hits, out[2] = cstats_.prompt_tokens, out[3] = cstats_.cached_tokens;
   out[4] = cstats_.saved, out[5] = cstats_.evicted, out[6] = int64_t(ckpts_.size()), out[7] = pool_.free_pages();
   // A page only checkpoints hold has as many references as checkpoints listing it (the scheduler counts these
@@ -860,7 +927,9 @@ void Model::kv_host_stats(int64_t* out) const {
   out[8] = host_kv_.failures();
 }
 
-void Model::cache_inventory_stats(int64_t* out) const {
+void Model::cache_inventory_stats(int64_t* out) {
+  // Optional diagnostic: take a stable snapshot, so transfer-owned host pages are not reported as leaks.
+  finish_kv_demotion(true);
   if (inventory_dirty_) {
     inventory_ = cache_inventory(ckpts_, kPageTokens);
     inventory_dirty_ = false;
@@ -2069,6 +2138,7 @@ int Model::area_first(int a) const { return pool_.pages() - (a + 1) * park_pages
 void Model::reserve_area(int a) { reserve_range(area_first(a), area_first(a) + park_pages_); }
 
 void Model::reserve_range(int lo, int hi) {
+  finish_kv_demotion(true);  // relocation/parking/VMM unmapping must never race a KV DMA source
   auto held = [&] {  // pages of the area the KV pool holds
     std::vector<int32_t> v;
     for (int p = lo; p < hi; p++)
