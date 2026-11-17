@@ -217,15 +217,48 @@ class FakeTok:
 def test_server_activation_and_force_prefix(thinking):
     srv = object.__new__(Server)
     srv.tok = FakeTok()
+    srv.encode = lambda text: list(text.encode())
     auto = srv.constrain(lambda: None, ("auto", None), tools(), thinking)
     assert auto["grammar_after"] == START
     assert accepts(auto["grammar"], call([("command", "ls")], start=False))
     required = srv.constrain(lambda: None, ("required", None), tools(), thinking)
     assert required["grammar_after"] == (THINK if thinking else None)
     assert srv.force(("required", None), thinking, required) is None
+    assert required["strict_tools_fallback"]["force"] == srv.force(("required", None), thinking)
     assert accepts(required["grammar"], call([("command", "ls")]))
     assert not accepts(required["grammar"], call([]))
     assert srv.constrain(lambda: None, ("none", None), tools(), thinking) is None
+
+
+@pytest.mark.parametrize("format_grammar", [None, "legacy_format"])
+def test_worker_tokenizer_fallback_preserves_choice_and_format(format_grammar, capsys):
+    from test_structured import scheduler, Matcher
+
+    sch = scheduler()
+    sch.reusable, sch.checkpoints, sch.im_start = lambda ids: 0, lambda ids, n: [], -1
+    seen = []
+
+    def matcher(g):
+        seen.append(g)
+        if g == "too_large_for_vocabulary":
+            raise ValueError("private schema diagnostic")
+        return Matcher()
+
+    sch.matcher = matcher
+    fallback = {"grammar": format_grammar, "grammar_after": None, "force": (None, [42, 43])}
+    req = {"ids": [1, 2], "max_new": 100, "temperature": 0, "top_k": 1, "top_p": 1,
+           "grammar": "too_large_for_vocabulary", "strict_tools": True, "strict_tools_fallback": fallback}
+    sch.submit("r", req)
+    q = sch.by_id["r"]
+    assert q.out == [42, 43] and q.eng_ids == [1, 2, 42, 43]
+    assert q.grammar == format_grammar
+    assert seen == ["too_large_for_vocabulary"] + ([format_grammar] if format_grammar else [])
+    assert sch.m["q27:strict_tool_fallbacks_total"] == 1
+    assert sch.m["q27:requests_total"] == 1
+    assert sch.m["q27:strict_tool_requests_total"] == 0
+    assert req["strict_tools"] is True  # original request is untouched
+    logged = capsys.readouterr().err
+    assert "legacy mode" in logged and "private" not in logged
 
 
 def test_output_format_and_strict_calls():

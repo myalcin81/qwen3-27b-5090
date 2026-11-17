@@ -867,7 +867,15 @@ class Server:
                         g = strict_tools.grammar(definitions, tokens, after_start=lazy, parallel=parallel,
                                                  lead_ws=thinking and not lazy)
                         after = tokens[0] if lazy else self.tok.token_id(THINK_END) if thinking else None
-                    return {"grammar": g, "grammar_after": after, "strict_tools": True}
+                    # Compilation without a tokenizer can succeed while the real vocabulary exceeds matcher
+                    # limits. Preserve the legacy format/forced choice for that final worker-side fallback.
+                    fallback_g = (structured.grammar(spec, lead_ws=thinking, calls=tokens)
+                                  if spec is not None and choice[0] == "auto" else None)
+                    fallback = {"grammar": fallback_g,
+                                "grammar_after": self.tok.token_id(THINK_END) if thinking else None,
+                                "force": self.force(choice, thinking)}
+                    return {"grammar": g, "grammar_after": after, "strict_tools": True,
+                            "strict_tools_fallback": fallback}
                 except (ValueError, RuntimeError, RecursionError, TypeError):
                     strict_tools.LOG.warning("strict_tools: request uses legacy mode (unsupported grammar or limit)")
             if spec is None or choice[0] in ("required", "named"):

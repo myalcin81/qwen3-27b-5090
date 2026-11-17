@@ -457,7 +457,9 @@ Responses API (for Codex), and Anthropic messages and count_tokens (for Claude C
   use delimited text; non-string values use JSON subgrammars. Auto without an output format activates the matcher
   after `<tool_call>`; required/named modes activate at the answer start (after `</think>` when enabled), without
   inserting an unconsumed forced prefix. Unsupported schemas log a per-tool legacy-argument fallback; oversized
-  requests log a full fallback. `q27:strict_tool_requests_total` counts these requests (including per-tool argument
+  requests log a full fallback. If construction with the real tokenizer fails, the worker retries once with the
+  legacy response format/forced choice before any engine work (`q27:strict_tool_fallbacks_total`).
+  `q27:strict_tool_requests_total` counts these requests (including per-tool argument
   fallbacks); the standard structured-output counters also include them. The parser
   skips complete JSON object/array values before looking for XML closing tags, so quoted delimiters stay data.
 - Anthropic `thinking` is honored; with `display: omitted`, the reasoning travels in the signature so that the next
