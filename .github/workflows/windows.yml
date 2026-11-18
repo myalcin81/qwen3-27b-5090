@@ -28,6 +28,9 @@ permissions:
 env:
   CUDA_VERSION: 13.3.1
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
+  # The rolling 19.52 compiler crashed cudafe++ during CMake compiler identification.
+  # Use the runner's installed 14.44 compatibility toolset instead of its changing default.
+  MSVC_TOOLSET: "14.44"
 
 jobs:
   package:
@@ -64,12 +67,14 @@ jobs:
           $p = Start-Process $exe -Wait -PassThru -ArgumentList "-s", "nvcc_$v", "nvvm_$v", "cudart_$v", "crt_$v", "thrust_$v"
           if ($p.ExitCode) { throw "CUDA installer exit code $($p.ExitCode)" }
           & "$env:CUDA_DIR\bin\nvcc.exe" --version
-      # MSVC from the runner's Visual Studio (vcvars64.bat), CMake and Ninja from its PATH.
+      # Select the installed compatibility toolset explicitly; fail if it is unavailable.
+      # CMake and Ninja come from the runner's PATH.
       - name: Build the package
         shell: cmd
         run: |
-          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VS=%%i"
-          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" || exit /b 1
+          for /f "usebackq delims=" %%i in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.14.44.17.14.x86.x64 -property installationPath`) do set "VS=%%i"
+          if not defined VS exit /b 1
+          call "%VS%\VC\Auxiliary\Build\vcvars64.bat" -vcvars_ver=%MSVC_TOOLSET% || exit /b 1
           set "CUDA_PATH=%CUDA_DIR%"
           set "CUDACXX=%CUDA_DIR%\bin\nvcc.exe"
           set "PATH=%CUDA_DIR%\bin;%PATH%"
