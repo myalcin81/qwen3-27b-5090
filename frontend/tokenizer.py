@@ -3,10 +3,15 @@ template, set up as transformers 5.18 does (`TokenizersBackend`, `render_jinja_t
 and encodes to the same ids (frontend/tests/test_tokenizer.py compares them where transformers is installed).
 """
 
+import array
+import collections
 import hashlib
 import json
+import os
 import pathlib
 import re
+import sys
+import threading
 from datetime import datetime
 
 import jinja2
@@ -43,6 +48,52 @@ class GenerationTag(jinja2.ext.Extension):
 
 
 _fingerprints = {}
+
+
+class _EncodingCache:
+    """Bounded exact-text LRU. Packed immutable ids never escape as a shared mutable result.
+
+    The two modes keep ordinary encoding separate from escaped-client text encoded without added tokens.
+    The budget includes retained strings, packed ids and a conservative per-entry bookkeeping allowance.
+    """
+
+    def __init__(self, limit):
+        self.limit = max(0, limit)
+        self.entries = collections.OrderedDict()
+        self.bytes = self.hits = self.misses = 0
+        self.lock = threading.Lock()
+
+    def get(self, plain, text):
+        with self.lock:
+            item = self.entries.get((plain, text))
+            if item is None:
+                self.misses += 1
+                return None
+            self.entries.move_to_end((plain, text))
+            self.hits += 1
+        return array.array("I", item[0]).tolist()
+
+    def put(self, plain, text, ids):
+        # A single huge prompt must not flush all repeatedly used message/tool-definition segments.
+        if sys.getsizeof(text) + 4 * len(ids) + 256 > self.limit // 4:
+            return
+        packed = array.array("I", ids).tobytes()
+        charge = sys.getsizeof(text) + sys.getsizeof(packed) + 256
+        if charge > self.limit // 4:
+            return
+        key = (plain, text)
+        with self.lock:
+            if old := self.entries.pop(key, None):
+                self.bytes -= old[1]
+            while self.entries and (self.bytes + charge > self.limit or len(self.entries) >= 256):
+                _, (_, size) = self.entries.popitem(last=False)
+                self.bytes -= size
+            self.entries[key] = (packed, charge)
+            self.bytes += charge
+
+    def stats(self):
+        with self.lock:
+            return dict(hits=self.hits, misses=self.misses, bytes=self.bytes, entries=len(self.entries), limit=self.limit)
 
 
 def _byte_decoder():
@@ -115,6 +166,9 @@ class Tokenizer:
         # Client text is kept as text (prompt_ids): the same tokenizer without added tokens encodes the parts of a
         # rendered prompt that came from the client, so "<|im_start|>" there is "<", "|", "im", ... and not the token.
         spec = json.loads((self.path / "tokenizer.json").read_text(encoding="utf-8"))
+        # BPE dropout deliberately makes encoding stochastic; memoizing it would change its behavior.
+        budget = int(os.environ.get("TOKENIZER_CACHE_MIB", "0")) * (1 << 20)
+        self._encoding_cache = _EncodingCache(0 if spec.get("model", {}).get("dropout") else budget)
         spec.update(added_tokens=[], truncation=None, padding=None, post_processor=None)
         self.plain = RustTokenizer.from_str(json.dumps(spec))
         strings = sorted({t.content for t in added.values()}, key=lambda s: (-len(s), s))
@@ -126,7 +180,30 @@ class Tokenizer:
         self._marked_re = re.compile(ESC + "(.)", re.S)
 
     def encode(self, text):
-        return self.tok.encode(text, add_special_tokens=False).ids
+        cache = self._encoding_cache
+        if cache.limit and (cached := cache.get(False, text)) is not None:
+            return cached
+        ids = self.tok.encode(text, add_special_tokens=False).ids
+        if cache.limit:
+            cache.put(False, text, ids)
+        return ids
+
+    def _encode_plain_batch(self, texts):
+        cache = self._encoding_cache
+        if not cache.limit:
+            return [e.ids for e in self.plain.encode_batch(texts, add_special_tokens=False)]
+        result = [cache.get(True, text) for text in texts]
+        missing = [i for i, ids in enumerate(result) if ids is None]
+        if missing:
+            encodings = self.plain.encode_batch([texts[i] for i in missing], add_special_tokens=False)
+            for i, encoding in zip(missing, encodings):
+                result[i] = encoding.ids
+                cache.put(True, texts[i], result[i])
+        return result
+
+    def encoding_cache_stats(self):
+        """CPU benchmark/diagnostic counters; no prompts, token ids or cache keys are exposed."""
+        return self._encoding_cache.stats()
 
     def paragraph_breaks(self):
         """Ids of the tokens that end a blank line (whitespace only, two or more newlines): where a document
@@ -236,7 +313,7 @@ class Tokenizer:
         parts.append((len(out), text[at:]))
         unmark = lambda m: self._unmark[m.group(1)]  # noqa: E731
         segs = [self._marked_re.sub(unmark, s) for _, s in parts]
-        encs = self.plain.encode_batch(segs, add_special_tokens=False)
-        for (pos, _), e in reversed(list(zip(parts, encs))):
-            out[pos:pos] = e.ids
+        encs = self._encode_plain_batch(segs)
+        for (pos, _), ids in reversed(list(zip(parts, encs))):
+            out[pos:pos] = ids
         return out
