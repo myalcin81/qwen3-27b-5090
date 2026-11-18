@@ -364,6 +364,14 @@ Admission still accounts for **device** capacity for the complete resumed contex
 subtracted from the device pages required by a new sequence. The existing `est_cached` estimate remains an
 ordering heuristic, while `prefix_begin` supplies the actual hit count.
 
+The GPU page pool maintains checkpoint references separately from total references. A page is reclaimable
+only when all its owners are checkpoints; adding an active, parked or temporary restore owner updates this
+classification immediately. Checkpoint-only capacity queries no longer rebuild the reference table, and
+parking/VMM moves transfer both counts. `Q27_CHECK_CACHE_REFS=1` enables an expensive full-scan oracle in
+`cache_stats()` for GPU correctness tests; leave it unset for performance measurements. The CPU ownership
+tests compare both counts and reclaimable capacity to a separate full scan after randomized mutations.
+`scripts/bench_cache_accounting.cc` measures this bookkeeping cost alone, not end-to-end inference speed.
+
 `q27:slots_allocated` reports the number of pinned state-cache slots actually allocated, including reusable
 slots without a retained checkpoint. It is a count, not bytes or the planned slot capacity, and is available
 on `/metrics` without enabling diagnostic inventory scans.
