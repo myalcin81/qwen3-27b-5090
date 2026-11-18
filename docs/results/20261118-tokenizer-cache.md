@@ -28,7 +28,7 @@ the resulting JSON and inspected the replay code.
 | Total process CPU time, s | 120.6 | 115.8 |
 
 Cache32 recorded 58 hits and 2,942 misses: approximately **1.9% call hits** and
-**1.5% text-byte hits**, with estimated peak retention32 MiB and 2,896 evictions.
+**1.5% text-byte hits**, with estimated peak retention 32 MiB and 2,896 evictions.
 The replay reported 59 repeated token sequences; 58 reused cached encodings.
 The template path made one encode call per reconstructed request. All 3,000
 baseline/candidate token-sequence hashes matched.
@@ -41,11 +41,33 @@ Its single fixed-order timing comparison cannot establish a causal CPU speedup.
 Exact ID parity, escaped-token boundaries, caller mutation, dropout behavior,
 eviction limits and concurrent access are separately covered by automated tests.
 
-The low observed hit rate does not justify enabling32 MiB for every server.
+The low observed hit rate does not justify enabling 32 MiB for every server.
 The implementation remains useful when exact retries/repeated prompts dominate,
 and can be enabled explicitly without changing the default path. Segment-level
 caching would need a separate design preserving BPE and special-token boundaries;
 it is not part of this change.
+
+## Final integration validation
+
+The default-off candidate was integrated with main `539231d` (protected-prefix
+retention and incremental checkpoint accounting), yielding runtime `45b6d1d`.
+The full CPU suite with address/undefined-behavior sanitizers passed **489 tests,
+16 skipped**, including a check that unset configuration bypasses cache lookup
+and storage for both ordinary and escaped-client encoding.
+
+Codex additionally compared 100 reconstructed local traffic requests containing
+4,073,226 input tokens on the actual model tokenizer. Explicit0, unset and
+explicit32 produced **byte-identical packed token-ID arrays for every request**;
+the enabled mode also returned identical IDs on immediate repeats. Explicit0
+and unset retained zero entries/bytes and made zero cache lookups. Enabled32
+stayed below its 33,554,432-byte budget (33,256,114 bytes observed). These
+deliberate repeats test correctness, not a real-traffic hit rate. The test is
+CPU-only and does not restart or load a GPU engine.
+
+The exact-comparison artifact is
+`/home/researcher/evals/codex-5b-exact-parity-20261118.json`; the tested
+`frontend/tokenizer.py` SHA-256 is
+`3af719d01cbfe56e377456ecef9e82460127b023f26191baa35eec431373f6df`.
 
 Evidence remains on aibench in `/home/researcher/evals/tt21/sonuc-3000.json`,
 `/home/researcher/tools/tt21.py` and TT-21 of
