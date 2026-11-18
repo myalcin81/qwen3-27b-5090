@@ -30,7 +30,7 @@ env:
   CUDA_DIR: C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3
   # The rolling 19.52 compiler crashed cudafe++ during CMake compiler identification.
   # Use the runner's installed 14.44 compatibility toolset instead of its changing default.
-  MSVC_TOOLSET: 14.44
+  MSVC_TOOLSET: "14.44"
 
 jobs:
   package:
