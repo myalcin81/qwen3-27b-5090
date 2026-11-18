@@ -529,3 +529,20 @@ gate without an explicit decision, recorded below with its numbers.
 - **Decode attention for several long requests at once.** Four requests with long contexts each are slower per
   request than the bandwidth allows ([benchmarks.md](benchmarks.md#known-weak-spots)).
 - **More than eight requests**: needs the batched GEMMs beyond 64 rows.
+- **Asynchronous GPU to host KV demotion** (`KV_ASYNC_DEMOTION`, fork PR #8, closed 2026-11-18): a bounded batch of
+  checkpoint-only pages copied on its own stream ahead of pool exhaustion. The mechanism worked (matched Nsight
+  traces: KV copy overlap with kernels 0% to 52%), but all KV copies of a run take 21 to 28 ms together, and with
+  the host tier really overflowing (68 GiB KV, 32 GiB state) warm probes stayed at 17 to 70 s and the cold phases
+  at 589 / 589 / 590 s for flag 0 / 1 / 0; event-synchronisation time rose from 2513 to 2940 ms in the fixture. It
+  removed no failure mode and added pending transfers that pressure, reset, parking, VMM lending and destruction
+  each have to drain. The 199 MB state checkpoints (about 3.6 ms each) already copy on their own stream. If host
+  demotion shows up as a measured wait, start from the per-slot readiness wait in `prefix_begin`. Yielding to the
+  scheduler during host to GPU restore was the planned next step and was not built for the same reason.
+- **CUDA 13.4 / 13.5** (reviewed 2026-11-18; the build stays on 13.3). The engine links only `libcudart` and
+  the release notes list no change to the runtime paths it uses (asynchronous copies, pinned memory, virtual
+  memory mapping). Of the compiler fixes, the one that could matter is 13.4's `ptxas` fix for a predicated
+  `REDUX.SUM` scheduled above its predicate (wrong results on Blackwell): `cuobjdump -sass` of the production
+  library shows one unpredicated `REDUX.MAX` in 168 functions and no `REDUX.SUM`. 13.5's `tensormap` fix does not
+  apply (no TMA). A toolkit change alters the generated code, so it needs the full GPU parity and greedy checks
+  again; without a fix that applies, there is nothing to gain. The notes mention no fix for the `cudafe++` crash
+  under MSVC 19.52, so the Windows build keeps the 14.44 toolset.
