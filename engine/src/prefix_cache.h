@@ -108,8 +108,54 @@ struct Checkpoint {
   bool ring = false;           // the draft's context ring is valid for [pos - 2048, pos)
   bool boundary = false;       // explicitly requested prompt/shared-prefix boundary (rather than an interval)
   uint64_t last_use = 0;
+  uint64_t last_reuse = 0;      // nonzero: bounded protection earned by a successful prefix restore
   int pos() const { return int(ids.size()); }
 };
+
+// Protection is charged conservatively by logical pages, including GPU-resident/shared pages. It therefore
+// cannot silently exceed the host budget when a protected prefix is demoted or another owner disappears.
+// Also bound state slots: a scan must always have probationary space. Dropping protection does not drop data.
+inline void trim_protected(std::vector<Checkpoint>& checkpoints, size_t page_budget, size_t slot_budget) {
+  size_t pages = 0, slots = 0;
+  std::vector<Checkpoint*> protected_entries;
+  for (auto& c : checkpoints) if (c.last_reuse) {
+    pages += c.pages.size();
+    ++slots;
+    protected_entries.push_back(&c);
+  }
+  std::stable_sort(protected_entries.begin(), protected_entries.end(), [](const auto* a, const auto* b) {
+    return a->last_reuse < b->last_reuse;
+  });
+  for (auto* c : protected_entries) {
+    if (pages <= page_budget && slots <= slot_budget) break;
+    pages -= c->pages.size();
+    --slots;
+    c->last_reuse = 0;
+  }
+}
+
+inline void protect_checkpoint(std::vector<Checkpoint>& checkpoints, size_t index, uint64_t clock,
+                                size_t page_budget, size_t slot_budget) {
+  auto& c = checkpoints[index];
+  // An oversized prefix must not flush the protected set only to lose its own protection afterwards.
+  if (slot_budget && c.pages.size() <= page_budget) c.last_reuse = clock;
+  trim_protected(checkpoints, page_budget, slot_budget);
+}
+
+inline bool eviction_before(const Checkpoint& a, const Checkpoint& b) {
+  if (bool(a.last_reuse) != bool(b.last_reuse)) return !a.last_reuse;
+  return a.last_use < b.last_use;
+}
+
+inline int cache_eviction_index(const std::vector<Checkpoint>& checkpoints, bool host_only = false) {
+  int victim = -1;
+  for (size_t i = 0; i < checkpoints.size(); ++i) {
+    const auto& c = checkpoints[i];
+    if (host_only && std::none_of(c.pages.begin(), c.pages.end(), [](int p) { return p < 0; })) continue;
+    if (victim < 0 || eviction_before(c, checkpoints[victim])) victim = int(i);
+  }
+  return victim;
+}
 
 struct CacheStats {
   int64_t lookups = 0, hits = 0, prompt_tokens = 0, cached_tokens = 0, saved = 0, evicted = 0;
@@ -206,7 +252,7 @@ inline int state_eviction_index(const std::vector<Checkpoint>& checkpoints, cons
     const int need = c.ring ? 2 : 1;
     const int rank = children[i] > 1 ? 3 : !(covered[i] & need) ? 2 :
                      !c.boundary ? 0 : (boundaries[i] & need) ? 1 : 2;
-    if (rank < best_rank || (rank == best_rank && c.last_use < nodes[victim]->last_use)) {
+    if (rank < best_rank || (rank == best_rank && eviction_before(c, *nodes[victim]))) {
       victim = int(i);
       best_rank = rank;
     }

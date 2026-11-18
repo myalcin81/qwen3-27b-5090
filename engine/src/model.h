@@ -333,6 +333,7 @@ class Model {
   // Prefix cache.
   bool cache_on_ = false;
   bool check_cache_refs_ = false;   // test-only full-scan oracle for incremental page ownership
+  bool protect_reused_ = false;
   std::vector<Checkpoint> ckpts_;
   HostKvPages host_kv_;
   size_t ckpt_bytes_ = 0;            // ssm + conv + draft ring

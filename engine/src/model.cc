@@ -82,6 +82,9 @@ Model::Model(const Options& opt) : opt_(opt) {
   cache_on_ = opt.state_cache_gib > 0;
   const char* check_refs = getenv("Q27_CHECK_CACHE_REFS");
   check_cache_refs_ = check_refs && atoi(check_refs) != 0;
+  const std::string cache_policy = getenv("KV_CACHE_POLICY") ? getenv("KV_CACHE_POLICY") : "lru";
+  Q27_CHECK(cache_policy == "lru" || cache_policy == "protected", "KV_CACHE_POLICY must be lru or protected");
+  protect_reused_ = cache_policy == "protected" && opt.kv_host_cache_gib > 0;
   conv_bytes_ = size_t(kGdnLayers) * kConvDim * (kConvK - 1) * sizeof(float);
   ssm_bytes_ = size_t(kGdnLayers) * kVHeads * kKDim * kVDim * sizeof(float);
   const bool spec = !opt.draft_dir.empty();
@@ -603,13 +606,9 @@ void Model::ensure_pages_of(std::vector<int32_t>& pages, int32_t* table, int tok
 }
 
 bool Model::evict_checkpoint(Eviction reason, bool host_only) {
-  auto it = ckpts_.end();
-  for (auto c = ckpts_.begin(); c != ckpts_.end(); ++c) {
-    if (host_only && std::none_of(c->pages.begin(), c->pages.end(), [](int p) { return p < 0; })) continue;
-    if (it == ckpts_.end() || c->last_use < it->last_use) it = c;
-  }
-  if (it == ckpts_.end()) return false;
-  erase_checkpoint(size_t(it - ckpts_.begin()), reason);
+  const int victim = cache_eviction_index(ckpts_, host_only);
+  if (victim < 0) return false;
+  erase_checkpoint(size_t(victim), reason);
   return true;
 }
 
@@ -681,9 +680,11 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
                                  bool ring, bool boundary, bool interval) {
   const int pos = int(ids.size());
   if (!cache_on_ || pos == 0) return;
+  uint64_t reused = 0;
   for (auto& c : ckpts_)
     if (c.pos() == pos && std::equal(c.ids.begin(), c.ids.end(), ids.begin())) {
       boundary |= c.boundary;  // a speculative upgrade inherits the plain checkpoint's prompt role
+      reused = std::max(reused, c.last_reuse);
       if (c.ring >= ring) {
         c.last_use = ++use_clock_;
         c.boundary = boundary;
@@ -694,6 +695,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   ck.ids = ids;
   ck.ring = ring;
   ck.boundary = boundary;
+  ck.last_reuse = reused;  // exact-prefix ring upgrades inherit protection, new saves never earn it
   // Keep opportunistic intervals while slots are available. Under pressure reclaim covered intermediates
   // first; if only useful ends/branch points remain, skip an interval instead of evicting another session.
   int slot = -1;
@@ -723,6 +725,7 @@ void Model::save_checkpoint_from(const char* area, const std::vector<int32_t>& i
   Q27_CUDA(cudaMemcpyAsync(slot_mem_[slot], stage_, ckpt_bytes_, cudaMemcpyDeviceToHost, cs_));
   Q27_CUDA(cudaEventRecord(stage_ev_, cs_));
   ckpts_.push_back(std::move(ck));
+  if (protect_reused_) trim_protected(ckpts_, size_t(host_kv_.capacity()) / 2, slot_mem_.size() / 2);
   inventory_dirty_ = true;
   cstats_.saved++;
 }
@@ -808,6 +811,14 @@ int Model::prefix_begin(const int32_t* ids, int n, const int32_t* at, int nat, b
     Q27_CUDA(cudaStreamSynchronize(s_));
     cstats_.hits++;
     cstats_.cached_tokens += cached;
+    // Promote only after a successful restore; a save/duplicate save or failed restore is not a reuse.
+    // Pressure relief may have erased the source checkpoint while temporary references kept its data alive.
+    if (protect_reused_)
+      for (size_t i = 0; i < ckpts_.size(); ++i)
+        if (ckpts_[i].pos() == cached && ckpts_[i].ring == ring && ckpts_[i].ids == seq_ids_) {
+          protect_checkpoint(ckpts_, i, ++use_clock_, size_t(host_kv_.capacity()) / 2, slot_mem_.size() / 2);
+          break;
+        }
   }
   // Checkpoints of this prefill: the requested positions, and the last few interval multiples that are
   // more than 64 tokens away from the others and from both ends (a chunk of <= 64 tokens takes the
