@@ -98,6 +98,7 @@ services:
       Q27_DRAFT_QUANT: ${Q27_DRAFT_QUANT:-fp4}     # draft linear layers: fp4 | fp8 | bf16
       Q27_DRAFT_VOCAB: ${Q27_DRAFT_VOCAB:-/work/bench/draft-vocab/vocab-128k.txt}  # candidate vocabulary; none: full
       STATE_HOST_CACHE: ${STATE_HOST_CACHE:-4}     # prefix cache: GiB of pinned state checkpoints (0: off)
+      KV_CACHE_POLICY: ${KV_CACHE_POLICY:-lru}      # protected: bounded protection after successful prefix reuse
       KV_HOST_CACHE: ${KV_HOST_CACHE:-0}           # optional pinned KV overflow tier, GiB (0: GPU only)
       Q27_CACHE_INVENTORY: ${Q27_CACHE_INVENTORY:-0} # optional prefix/page accounting (diagnostic scans)
       KV_POOL_TOKENS: ${KV_POOL_TOKENS:-0}         # 0: what the VRAM budget leaves
