@@ -167,7 +167,7 @@ class Tokenizer:
         # rendered prompt that came from the client, so "<|im_start|>" there is "<", "|", "im", ... and not the token.
         spec = json.loads((self.path / "tokenizer.json").read_text(encoding="utf-8"))
         # BPE dropout deliberately makes encoding stochastic; memoizing it would change its behavior.
-        budget = int(os.environ.get("TOKENIZER_CACHE_MIB", "32")) * (1 << 20)
+        budget = int(os.environ.get("TOKENIZER_CACHE_MIB", "0")) * (1 << 20)
         self._encoding_cache = _EncodingCache(0 if spec.get("model", {}).get("dropout") else budget)
         spec.update(added_tokens=[], truncation=None, padding=None, post_processor=None)
         self.plain = RustTokenizer.from_str(json.dumps(spec))

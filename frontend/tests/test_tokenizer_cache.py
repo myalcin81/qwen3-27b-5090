@@ -40,6 +40,23 @@ def pair(model, monkeypatch):
     return baseline, Tokenizer(model)
 
 
+def test_default_bypasses_cache_for_plain_and_escaped_requests(model, monkeypatch):
+    monkeypatch.delenv("TOKENIZER_CACHE_MIB", raising=False)
+    tok = Tokenizer(model)
+
+    def unexpected_cache_access(*args):
+        pytest.fail("default tokenizer must not look up or retain prompt encodings")
+
+    monkeypatch.setattr(tok._encoding_cache, "get", unexpected_cache_access)
+    monkeypatch.setattr(tok._encoding_cache, "put", unexpected_cache_access)
+    for text in ["hello world", "Türkçe 日本語 🎉", "<|im_start|>" + ESC]:
+        for _ in range(2):
+            assert tok.encode(text) == tok.tok.encode(text, add_special_tokens=False).ids
+            assert tok._encode_plain_batch([text])[0] == tok.plain.encode(text, add_special_tokens=False).ids
+            tok.prompt_ids([{"role": "user", "content": text}])
+    assert tok.encoding_cache_stats() == dict(hits=0, misses=0, bytes=0, entries=0, limit=0)
+
+
 def test_growing_chats_and_injection_parity(model, monkeypatch):
     baseline, cached = pair(model, monkeypatch)
     for body in ["hello world", "Türkçe 日本語 🎉\r\n", ESC, "".join(SPECIAL), "word sword  word "]:
