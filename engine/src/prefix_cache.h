@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cassert>
 #include <cstdint>
 #include <iterator>
 #include <map>
@@ -24,6 +25,8 @@ class PagePool {
   // (P7-13); high (Q27_PAGES_HIGH, tests): the highest, so parking moves pages.
   void init(int pages, bool high = false) {
     ref_.assign(pages, 0);
+    checkpoint_ref_.assign(pages, 0);
+    checkpoint_only_ = 0;
     ref_[0] = 1;
     free_.clear();
     for (int p = 1; p < pages; p++) free_.insert(free_.end(), p);
@@ -32,6 +35,8 @@ class PagePool {
   int pages() const { return int(ref_.size()); }
   int free_pages() const { return int(free_.size()); }
   int refs(int p) const { return ref_[p]; }
+  int checkpoint_refs(int p) const { return checkpoint_ref_[p]; }
+  int checkpoint_only_pages() const { return checkpoint_only_; }
   // -1 when the pool is empty.
   int alloc() { return alloc_outside(0, 0); }
   // A free page outside [lo, hi); -1 when there is none.
@@ -63,17 +68,35 @@ class PagePool {
   }
   // The references of page p move to page q (from alloc_outside); p is free then.
   void move(int p, int q) {
+    assert(p != q && ref_[q] == 1 && checkpoint_ref_[q] == 0);
+    checkpoint_only_ -= checkpoint_only(p) + checkpoint_only(q);
     ref_[q] = ref_[p];
+    checkpoint_ref_[q] = checkpoint_ref_[p];
     ref_[p] = 0;
+    checkpoint_ref_[p] = 0;
+    checkpoint_only_ += checkpoint_only(q);
     free_.insert(p);
   }
-  void ref(int p) { ref_[p]++; }
-  void unref(int p) {
-    if (--ref_[p] == 0) free_.insert(p);
-  }
+  void ref(int p) { change_refs(p, 1, 0); }
+  void unref(int p) { change_refs(p, -1, 0); }
+  // A checkpoint owns both a total reference and a checkpoint reference. Active/parked sequences and
+  // in-flight copies use ref/unref, so they immediately remove a page from the reclaimable count.
+  void checkpoint_ref(int p) { change_refs(p, 1, 1); }
+  void checkpoint_unref(int p) { change_refs(p, -1, -1); }
 
  private:
-  std::vector<int32_t> ref_;
+  bool checkpoint_only(int p) const { return checkpoint_ref_[p] > 0 && checkpoint_ref_[p] == ref_[p]; }
+  void change_refs(int p, int all, int checkpoints) {
+    assert(ref_[p] > 0);
+    checkpoint_only_ -= checkpoint_only(p);
+    ref_[p] += all;
+    checkpoint_ref_[p] += checkpoints;
+    assert(checkpoint_ref_[p] >= 0 && checkpoint_ref_[p] <= ref_[p]);
+    checkpoint_only_ += checkpoint_only(p);
+    if (!ref_[p]) free_.insert(p);
+  }
+  std::vector<int32_t> ref_, checkpoint_ref_;
+  int checkpoint_only_ = 0;
   std::set<int32_t> free_;
   bool high_ = false;
 };
@@ -247,17 +270,16 @@ inline std::vector<int32_t> checkpoint_refs(const std::vector<Checkpoint>& check
 
 inline std::vector<int32_t> demotion_batch(const std::vector<Checkpoint>& checkpoints, const PagePool& pool,
                                           size_t limit = 256) {
-  const auto refs = checkpoint_refs(checkpoints, pool.pages());
   const Checkpoint* oldest = nullptr;
   for (const auto& c : checkpoints) {
     if (oldest && c.last_use >= oldest->last_use) continue;
     for (int p : c.pages)
-      if (p > 0 && refs[p] == pool.refs(p)) { oldest = &c; break; }
+      if (p > 0 && pool.checkpoint_refs(p) == pool.refs(p)) { oldest = &c; break; }
   }
   std::vector<int32_t> pages;
   if (oldest)
     for (int p : oldest->pages) {
-      if (p > 0 && refs[p] == pool.refs(p)) pages.push_back(p);
+      if (p > 0 && pool.checkpoint_refs(p) == pool.refs(p)) pages.push_back(p);
       if (pages.size() == limit) break;
     }
   return pages;

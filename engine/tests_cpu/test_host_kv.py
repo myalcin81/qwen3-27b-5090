@@ -55,7 +55,7 @@ int main(int argc, char** argv) {
   } else if (test == "shared_round_trip") {
     HostKvPages h; h.init(2, 64, alloc, release);
     PagePool gpu; gpu.init(3);
-    int p = gpu.alloc(); gpu.ref(p);  // two checkpoint owners
+    int p = gpu.alloc(); gpu.checkpoint_ref(p); gpu.checkpoint_ref(p); gpu.unref(p);  // two checkpoint owners
     std::vector<Checkpoint> cs(2);
     cs[0].pages = {p}; cs[0].slot = 4; cs[0].ring = true; cs[0].last_use = 1;
     cs[1].pages = {p}; cs[1].slot = 5; cs[1].ring = true; cs[1].last_use = 2;
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
     assert(batch == std::vector<int32_t>{p});
     const int hp = h.alloc();
     std::memset(h.data(hp), 73, 64);  // completed D2H copy (GPU runner tests the real transfer)
-    rebind_checkpoints(cs, {{p, hp}}, [&](int x) { gpu.unref(x); }, [&](int x) { h.ref(x); });
+    rebind_checkpoints(cs, {{p, hp}}, [&](int x) { gpu.checkpoint_unref(x); }, [&](int x) { h.ref(x); });
     h.unref(hp);
     assert(h.used() == 1 && h.refs(hp) == 2 && gpu.refs(p) == 0);
     assert(cs[0].slot == 4 && cs[1].slot == 5 && cs[0].ring && cs[1].ring);
@@ -72,7 +72,7 @@ int main(int argc, char** argv) {
     const int restored = gpu.alloc();
     char data[64]; std::memcpy(data, h.data(hp), 64);
     h.ref(hp); // restore's temporary reference, held until the copy has finished
-    rebind_checkpoints(cs, {{hp, restored}}, [&](int x) { h.unref(x); }, [&](int x) { gpu.ref(x); });
+    rebind_checkpoints(cs, {{hp, restored}}, [&](int x) { h.unref(x); }, [&](int x) { gpu.checkpoint_ref(x); });
     h.unref(hp);
     for (char c : data) assert(c == 73);
     assert(h.used() == 0 && gpu.refs(restored) == 3 && gpu.refs(reused) == 1);
@@ -83,7 +83,9 @@ int main(int argc, char** argv) {
   } else if (test == "active_and_lru") {
     PagePool gpu; gpu.init(5);
     int active = gpu.alloc(), recent = gpu.alloc(), old = gpu.alloc();
-    gpu.ref(active);  // active/parked request plus checkpoint
+    gpu.checkpoint_ref(active);  // active/parked request plus checkpoint
+    gpu.checkpoint_ref(recent); gpu.unref(recent);
+    gpu.checkpoint_ref(old); gpu.unref(old);
     std::vector<Checkpoint> cs(3);
     cs[0].pages = {active, -1}; cs[0].last_use = 0;
     cs[1].pages = {recent}; cs[1].last_use = 20;
@@ -94,7 +96,9 @@ int main(int argc, char** argv) {
   } else if (test == "batch_limit") {
     PagePool gpu; gpu.init(601);
     std::vector<Checkpoint> cs(1);
-    for (int i = 0; i < 600; i++) cs[0].pages.push_back(gpu.alloc());
+    for (int i = 0; i < 600; i++) {
+      const int p = gpu.alloc(); cs[0].pages.push_back(p); gpu.checkpoint_ref(p); gpu.unref(p);
+    }
     assert(demotion_batch(cs, gpu).size() == 256);
   } else if (test == "restore_protection") {
     HostKvPages h; h.init(1, 32, alloc, release);

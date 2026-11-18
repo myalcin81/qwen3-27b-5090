@@ -236,6 +236,7 @@ class Model {
   bool relieve_kv_pressure();        // demote checkpoint-only pages, or evict when the host tier is full
   void cache_ref(int p) { if (p > 0) pool_.ref(p); else host_kv_.ref(p); }
   void cache_unref(int p) { if (p > 0) pool_.unref(p); else host_kv_.unref(p); }
+  void checkpoint_unref(int p) { if (p > 0) pool_.checkpoint_unref(p); else host_kv_.unref(p); }
   void spec_body(const SpecSampling& smp, int part = 0);  // part 1: the draft only, 2: the rest (0: all)
   void spec_part(const SpecSampling& smp, int part);      // a masked step's part, captured by its settings
   // Captures body; with update, updates that graph in place when only arguments / grids differ (else replaces it).
@@ -331,6 +332,7 @@ class Model {
 
   // Prefix cache.
   bool cache_on_ = false;
+  bool check_cache_refs_ = false;   // test-only full-scan oracle for incremental page ownership
   bool protect_reused_ = false;
   std::vector<Checkpoint> ckpts_;
   HostKvPages host_kv_;
